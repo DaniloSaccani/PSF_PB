@@ -47,7 +47,7 @@ Rlyapunov = np.array([[r_u]], dtype=float)
 
 
 # —————— 1) Create experiment folder (including num_samples in its name) ——————
-RUN_DIR = Path(__file__).resolve().parent  # folder that contains run.py
+RUN_DIR = Path(__file__).resolve().parent  # folder that contains run_training.py
 now = datetime.now().strftime("%m_%d_%H_%M_%S")
 folder_name = f'PSF_RENs_NS_{now}'
 save_folder = (RUN_DIR / 'results' / folder_name)
