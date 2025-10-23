@@ -35,7 +35,7 @@ RHOBAR_LIST = [10.00, 0.25, 0.50, 0.75]
 # Obstacle (Gaussian, moving)
 #   We draw the 95% iso-probability contour.
 # -----------------------------
-OBS_CENTERS = np.array([[1.0, 0.5]], dtype=float)     # shape (n_obs, 2)
+OBS_CENTERS = np.array([[1, 0.5]], dtype=float)     # shape (n_obs, 2)
 OBS_COVS    = np.array([0.005], dtype=float)          # variance (isotropic)
 OBS_VEL     = np.array([[-0.2, 0.0]], dtype=float)    # shape (n_obs, 2)
 CHI2_2_95   = 5.991464547107979                       # chi2 df=2 at 95%

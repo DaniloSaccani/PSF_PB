@@ -17,6 +17,18 @@ def loss_state_tracking(state, target_positions, Q):
     dx = state - target_positions
     return (F.linear(dx, Q) * dx).sum()
 
+# ---- Absolute control effort  ϕ(u) = uᵀ R u  ----
+def loss_control_effort_abs(u, R):
+    """
+    Penalizes absolute effort. Supports R as (m,m) or (m,) diagonal.
+    u: shape (m,) or (1,m) or (m,1)
+    """
+    u = u.reshape(-1, 1)                             # (m,1)
+    if R.ndim == 1:
+        Rm = torch.diag(R)                           # (m,m)
+    else:
+        Rm = R
+    return (u.t() @ Rm @ u).squeeze()                # scalar
 
 def loss_control_effort(u, R, uL=None):
     """
@@ -71,3 +83,56 @@ def normpdf(q, mu, cov):
         dists.append(torch.norm(qi - mu, dim=1))
     all_dists = torch.cat(dists)
     return out, all_dists.min()
+
+
+# --- PDF clipped at 95% Mahalanobis contour (χ2_2(0.95) = 5.991464547) ---
+def loss_obstacle_avoidance_pdf95clip(state, obstacle_position, obstacle_cov,
+                                      chi2_2_95: float = 5.991464547, smooth: float = 0.0):
+    """
+    ℓ_obs = ReLU(pdf(x) - pdf_95), where pdf_95 is the Gaussian PDF value
+    on the 95% ellipse (Mahalanobis^2 = χ^2_2(0.95)).
+    Outside that ellipse the loss is 0; inside it grows with the PDF.
+    If 'smooth' > 0, Softplus smoothing replaces the hard ReLU.
+    """
+    d = 2
+    x  = state.reshape(-1, d)
+    mu = obstacle_position.reshape(1, d).to(dtype=state.dtype, device=state.device)
+
+    # σ² (scalar tensor on the right device/dtype)
+    var = torch.as_tensor(obstacle_cov, dtype=state.dtype, device=state.device)
+
+    # Mahalanobis^2 for isotropic covariance
+    dx = x - mu
+    r2 = (dx * dx).sum(dim=1) / var  # shape (N,)
+
+    # Normalizer: (2π)^(d/2) * sqrt(|Σ|); with Σ=diag(σ²,σ²), sqrt(|Σ|)=σ²
+    den = (2 * torch.pi) ** (d * 0.5) * var  # scalar tensor
+
+    pdf = torch.exp(-0.5 * r2) / den  # (N,)
+
+    # Ensure chi2 is a tensor (fixes your error)
+    chi2 = torch.as_tensor(chi2_2_95, dtype=state.dtype, device=state.device)
+    pdf_95 = torch.exp(-0.5 * chi2) / den  # scalar tensor
+
+    raw = pdf - pdf_95
+    if smooth > 0.0:
+        loss = torch.nn.functional.softplus(raw / smooth, beta=1.0).sum() * smooth
+    else:
+        loss = torch.clamp(raw, min=0.0).sum()
+
+    min_dis = torch.norm(dx, dim=1).min()
+    return loss, min_dis
+
+# 97.5% ellipse: χ²₂(0.975) = 7.377758908
+def loss_obstacle_avoidance_pdf975clip(state, obstacle_position, obstacle_cov, smooth: float = 0.05):
+    return loss_obstacle_avoidance_pdf95clip(
+        state, obstacle_position, obstacle_cov,
+        chi2_2_95=7.377758908, smooth=smooth
+    )
+
+# 99% ellipse: χ²₂(0.99) = 9.210340372
+def loss_obstacle_avoidance_pdf99clip(state, obstacle_position, obstacle_cov, smooth: float = 0.05):
+    return loss_obstacle_avoidance_pdf95clip(
+        state, obstacle_position, obstacle_cov,
+        chi2_2_95=9.210340372, smooth=smooth
+    )

@@ -2,19 +2,19 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from types import SimpleNamespace  # <— add
+from types import SimpleNamespace
+import math
 
-import loss_function as lf         # <— fix module name
+import loss_function as lf
 from PSF import MPCPredictSafetyFilter
 from single_pendulum_sys import SinglePendulum, SinglePendulumCasadi
 
-# class PendulumEnv(DiscreteTransferFunctionEnv):   # <— remove base
 class PendulumEnv:
     def __init__(self,
         x0 = torch.tensor([0.0, 0.0]),
         target_positions = np.array([np.pi, 0]),
         obstacle=None,
-        obstacle_avoidance_loss_function="pdf",
+        obstacle_avoidance_loss_function="pdf99clip", #before "pdf"
         prestabilized=True,
         disturbance=True,
         nonlinear_damping=True,
@@ -30,6 +30,7 @@ class PendulumEnv:
         epsilon = 0.05,
         alpha_obst = 1,
         alpha_control = 1,
+        alpha_control_abs=0.0,
         alpha_state = 1,
         alpha_ca = 1,
         alpha_cer = 1,
@@ -39,7 +40,16 @@ class PendulumEnv:
         Qlyapunov=None,
         Rlyapunov=None,
         Q = None,
-        R = None
+        R = None,
+        horizon=None,
+        final_convergence_window=(220, 250),  # (t0, t1) in sim steps
+        convergence_theta_tol=0.08,  # rad, ~4.6°
+        convergence_omega_tol=0.30,  # rad/s
+        convergence_hold_steps=5,  # require K consecutive steps
+        convergence_bonus=5.0,  # per-step bonus scale
+        # --- OPTIONAL: de-emphasize early tracking ---
+        use_ramped_state_weight = False,
+        state_weight_warmup = 0.20
     ):
         self.n = 2
         self.m = 1
@@ -51,6 +61,11 @@ class PendulumEnv:
             rho_bar = 0.5
         if rho_max is None:
             rho_max = 2.0
+
+        if horizon is None:
+            self.horizon = 15
+        else:
+            self.horizon = horizon
 
         self.t = 0
         self.dt = 0.05
@@ -66,6 +81,7 @@ class PendulumEnv:
 
         self.alpha_obst = alpha_obst
         self.alpha_control = alpha_control
+        self.alpha_control_abs = alpha_control_abs
         self.alpha_state = alpha_state
         self.alpha_ca = alpha_ca
         self.alpha_cer = alpha_cer
@@ -75,6 +91,17 @@ class PendulumEnv:
         self.step_reward_control_effort_regularization = None
         self.step_reward_obstacle_avoidance = None
         self.step_reward_collision_avoidance = None
+
+        self.final_window_start, self.final_window_end = final_convergence_window
+        self.theta_tol = float(convergence_theta_tol)
+        self.omega_tol = float(convergence_omega_tol)
+        self.convergence_hold_steps = int(convergence_hold_steps)
+        self.convergence_bonus = float(convergence_bonus)
+        self.use_ramped_state_weight = bool(use_ramped_state_weight)
+        self.state_weight_warmup = float(state_weight_warmup)
+
+        self.converged_counter = 0
+        self.step_reward_convergence = torch.tensor(0.0, dtype=torch.double)
 
         # weights for loss
         if Q is None:
@@ -131,7 +158,7 @@ class PendulumEnv:
         sys_casadi = SinglePendulumCasadi(xbar=np.array(target_positions, dtype=float))
         self.PSF = MPCPredictSafetyFilter(
             sys_casadi,
-            horizon=15,
+            horizon=self.horizon,
             state_lower_bound=self.state_limit_low.numpy(),   # <— flat
             state_upper_bound=self.state_limit_high.numpy(),  # <— flat
             control_lower_bound=self.control_limit_low.numpy(),
@@ -156,6 +183,8 @@ class PendulumEnv:
         self.prev_action *= 0.0
         self.t = 0
         self.min_dis = torch.tensor(float('inf'), dtype=self.state.dtype, device=self.state.device)
+        self.converged_counter = 0
+        self.step_reward_convergence = torch.tensor(0.0, dtype=torch.double)
         return self.state.squeeze(0).squeeze(0)  # return (n,) to the agent
 
     def step(self, action, U_prev=None, X_prev=None):
@@ -185,11 +214,23 @@ class PendulumEnv:
 
         # losses (match dtypes/devices)
         loss_states = lf.loss_state_tracking(self.state.squeeze(0).squeeze(0), self.target_positions, self.Q)
-        self.step_reward_state_error = - self.alpha_state * loss_states
+        alpha_state_eff = self.alpha_state
+        if self.use_ramped_state_weight:
+            t0, t1 = self.final_window_start, self.final_window_end
+            # ramp w(t): 0 before t0 → 1 at t1
+            w = (self.t - t0) / max(1, (t1 - t0))
+            w = max(0.0, min(1.0, float(w)))
+            # keep a small fraction early, then ramp up
+            alpha_state_eff = self.alpha_state * (self.state_weight_warmup + (1.0 - self.state_weight_warmup) * w)
+
+        self.step_reward_state_error = - alpha_state_eff * loss_states
 
         uL_torch = torch.tensor(uL, dtype=torch.double)  # for diff penalty
         loss_action = lf.loss_control_effort(action_t.squeeze(0).squeeze(0), self.R, uL_torch)
         self.step_reward_control_effort = - self.alpha_control * loss_action
+
+        loss_abs = lf.loss_control_effort_abs(action_t.squeeze(0).squeeze(0), self.R)
+        self.step_reward_control_effort_abs = - self.alpha_control_abs * loss_abs
 
         self.step_reward_control_effort_regularization = 0
         if self.control_reward_regularization:
@@ -211,10 +252,33 @@ class PendulumEnv:
             min_dis = torch.as_tensor(min_dis, dtype=self.state.dtype, device=self.state.device)
             self.min_dis = torch.minimum(self.min_dis, min_dis)
 
+        # --- Late-window convergence bonus (only matters near the end) ---
+        t0, t1 = self.final_window_start, self.final_window_end
+        w = (self.t - t0) / max(1, (t1 - t0))  # linear ramp 0→1 on [t0, t1]
+        w = max(0.0, min(1.0, float(w)))
+        w_t = torch.tensor(w, dtype=torch.double, device=self.state.device)
+
+        theta = self.state[0, 0, 0]
+        omega = self.state[0, 0, 1]
+
+        # angle error to π, wrapped to (-π, π]
+        theta_err = torch.atan2(torch.sin(theta - math.pi), torch.cos(theta - math.pi))
+
+        inside = (torch.abs(theta_err) <= self.theta_tol) & (torch.abs(omega) <= self.omega_tol)
+
+        # require K consecutive "inside" steps to count as converged
+        self.converged_counter = self.converged_counter + 1 if bool(inside) else 0
+        hold_ok = self.converged_counter >= self.convergence_hold_steps
+        hold_ok_t = torch.tensor(1.0 if hold_ok else 0.0, dtype=torch.double, device=self.state.device)
+
+        self.step_reward_convergence = w_t * hold_ok_t * self.convergence_bonus
+
         reward = self.step_reward_state_error \
                  + self.step_reward_control_effort \
                  + self.step_reward_control_effort_regularization \
-                 + self.step_reward_obstacle_avoidance
+                 + self.step_reward_control_effort_abs \
+                 + self.step_reward_obstacle_avoidance \
+                 + self.step_reward_convergence
 
         terminated = False
         truncated = False

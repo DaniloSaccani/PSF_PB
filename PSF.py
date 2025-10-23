@@ -129,7 +129,7 @@ class MPCPredictSafetyFilter:
                 )
             error_omega_T = self.X[1, self.horizon] - self.xbar[1]
             err_vec_T = ca.vertcat(delta_theta_T, error_omega_T)
-            J_curr += ca.mtimes([err_vec_T.T, self.P, err_vec_T])
+            #J_curr += ca.mtimes([err_vec_T.T, self.P, err_vec_T])
 
             # Terminal set constraint
             self.opti.subject_to(self.X[:, self.horizon] == self.xbar)

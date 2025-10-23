@@ -1,118 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, re, ast
 import numpy as np
 import torch
+import logging
+from datetime import datetime
+from pathlib import Path
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
 from mad_controller import MADController
 from pendulum_env import PendulumEnv
 from obstacles import MovingObstacle
 from plot_functions import plot_results
-import os
-import logging
-from datetime import datetime
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-from pathlib import Path
-
-# NEW: imports for the PSF-only baseline and model geometry
 from single_pendulum_sys import SinglePendulum, SinglePendulumCasadi
 from PSF import MPCPredictSafetyFilter
 
-# ---------------- 0) Hyperparameters & Reproducibility ----------------
+# ----------------------------- 0) MODE & PATHS -----------------------------
+# "scratch" : random init
+# "resume"  : load actor/critic from results/<RESUME_RUN_FOLDER>/model_best.pth
+START_MODE = "resume"  # <-- set "scratch" or "resume"
+RESUME_RUN_FOLDER = "PSF_SSM_NS_10_22_12_30_21"  # used if START_MODE == "resume"
+
+# ---------------- 0bis) Hyperparameters & Reproducibility ----------------
 torch.set_default_dtype(torch.double)
 torch.manual_seed(1)
 np.random.seed(1)
+mpl.rcParams['text.usetex'] = False
 
-# --- (A) User‐tunable quantities ---
-sim_horizon       = 250   # Simulation horizon
-sampled_noise_    = 0.1   # Initial x0 noise
-loss_x_multiplier = 0.12   # was 0.03
-loss_u_multiplier = 0.35   # was 2
-loss_obs_multiplier = 3
-epsilon           = 0.05  # PSF threshold
-dim_internal      = 10
-num_epochs        = 300
-obs_centers       = torch.tensor([[1, 0.5]])
+# --- (A) User‐tunable quantities (used for SCRATCH; may be overridden on RESUME) ---
+sim_horizon       = 250
+sampled_noise_    = 0.1
+loss_x_multiplier        = 0.15   # was 0.12 (slightly stronger state term)
+loss_u_match_multiplier  = 0.01   # was 0.10
+loss_u_abs_multiplier    = 0.01   # was 0.80  <-- key change
+loss_obs_multiplier = 5.0
+alpha_cer         = 0.2
+epsilon           = 0.1   # PSF threshold
+dim_internal      = 10     # auto-overridden on resume to match checkpoint
+num_epochs        = 180
+obs_centers       = torch.tensor([[1.0, 0.5]])
 obs_covs          = torch.tensor([0.005])
 obs_vel           = torch.tensor([[-0.2, 0.0]])
-state_lower_bound = torch.tensor([0.5, -20])
-state_upper_bound = torch.tensor([2 * np.pi - 0.5, 20])
+state_lower_bound = torch.tensor([0.5, -20.0])
+state_upper_bound = torch.tensor([2 * np.pi - 0.5, 20.0])
 control_lower_bound = torch.tensor([-3.0])
-control_upper_bound = torch.tensor([3.0])
+control_upper_bound = torch.tensor([ 3.0])
 target_positions  = torch.tensor([np.pi, 0.0], dtype=torch.double)
 start_position    = np.pi / 2
-noise_std         = 0.5  # RL Exploration Noise
-alpha_cer         = 0.6    # weight for Δu penalty
-theta0_low, theta0_high = 0.6, 1.9
-decayExpNoise     = 0.9  # per-epoch decay of exploration noise
-# ---------------- (B) Fixed quantities ----------------
-# Learned policy rollouts use FIXED rho=0.5; baseline uses scheduler with rhobar=0.5
-rho = None
-rho_bar = 0.5
-rho_max = 2.0
-nn_type = 'mad'
+noise_std         = 0.8
+theta0_low, theta0_high = 3.14-2.6, 3.14-0.75
+decayExpNoise     = 0.95
+PSFhorizon        = 20
 
-q_theta = 50
-q_theta_dot = 10
+# ---------------- (B) Fixed quantities ----------------
+# Use scheduled ρ during learned rollouts; baseline uses ρ̄ for comparison plots.
+rho      = None
+rho_bar  = 0.5
+rho_max  = 10.0
+nn_type  = 'mad'
+
+q_theta = 50.0
+q_theta_dot = 10.0
 r_u = 0.1
-Qlyapunov = np.diag([q_theta, q_theta_dot]).astype(float)   # shape (2,2)
+Qlyapunov = np.diag([q_theta, q_theta_dot]).astype(float)
 Rlyapunov = np.array([[r_u]], dtype=float)
 
-# Baseline PSF horizon and references
-BASELINE_HORIZON = 20
-SAFE_TH_LO = 0.5
-SAFE_TH_HI = 2*np.pi - 0.5
-RHO_MAX_BASELINE = 1.0
-
-# Obstacle shading constants
 DT = 0.05
 CHI2_2_95 = 5.991464547107979
 OBSTACLE_SHADE_COLOR = (0.85, 0.2, 0.2, 0.18)
 
-# ---------------- Helpers ----------------
-def to_numpy(x):
-    """Return a NumPy array from either a Tensor or an ndarray/list."""
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
+# ---------------- Helpers: parsing + SSM detection ----------------
+FLOAT_RE = r'[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?'
 
-def unpack_logs(obs_log, u_L_log, u_log):
-    """Make logs NumPy and unify shapes to (T+1,2), (T,1), (T,1)."""
-    obs = to_numpy(obs_log)
-    uL  = to_numpy(u_L_log)
-    u   = to_numpy(u_log)
-    if obs.ndim == 3:  # (B, T+1, 2)
-        obs = obs[0]
-    if uL.ndim == 3:   # (B, T, 1)
-        uL = uL[0]
-    if u.ndim == 3:    # (B, T, 1)
-        u = u[0]
-    return obs, uL, u
+def parse_last_float(line, default=None):
+    ms = re.findall(FLOAT_RE, line)
+    return float(ms[-1]) if ms else default
 
-def wrap_0_2pi(a):
-    return (a + 2*np.pi) % (2*np.pi)
+def parse_last_int(line, default=None):
+    ms = re.findall(r'\d+', line)
+    return int(ms[-1]) if ms else default
 
-def theta_arcs_hit_obstacle(center_xy, link_length, cov_var, chi2_val=CHI2_2_95):
-    """
-    95% 'collision' arc: pendulum tip p(θ) = [L sin θ, -L cos θ] inside circle
-    radius r = sqrt(chi2 * cov) centered at center_xy. Returns list of (θ_lo, θ_hi) in [0, 2π).
-    """
-    r = np.sqrt(chi2_val * cov_var)
-    c = np.asarray(center_xy, dtype=float)
-    L = float(link_length)
-    norm_c = np.linalg.norm(c)
-    if norm_c < 1e-12:
-        return [(0.0, 2*np.pi)] if r >= L else []
-    zeta = (L**2 + norm_c**2 - r**2) / (2.0 * L * norm_c)
-    if zeta <= -1.0:
-        return [(0.0, 2*np.pi)]
-    if zeta >=  1.0:
-        return []
-    delta = np.arccos(zeta)
-    phi   = np.arctan2(c[1], c[0])
-    th_lo = wrap_0_2pi(phi - delta + np.pi/2)
-    th_hi = wrap_0_2pi(phi + delta + np.pi/2)
-    if th_lo <= th_hi:
-        return [(th_lo, th_hi)]
+def parse_tensor_like(line, default=None):
+    m = re.search(r'\[(.*)\]', line)
+    if not m: return default
+    inner = m.group(0)
+    try:
+        arr = ast.literal_eval(inner)
+        return np.array(arr, dtype=float)
+    except Exception:
+        vals = re.findall(FLOAT_RE, inner)
+        if not vals: return default
+        return np.array([float(v) for v in vals], dtype=float)
+
+def load_meta_from_log(log_path):
+    meta = {}
+    if not os.path.exists(log_path): return meta
+    with open(log_path, 'r') as f:
+        lines = f.read().splitlines()
+    for ln in lines:
+        if 'Simulation horizon (T)' in ln:
+            meta['sim_horizon'] = parse_last_int(ln)
+        elif 'Epsilon for PSF' in ln:
+            meta['epsilon'] = parse_last_float(ln)
+        elif 'RENs dim_internal' in ln:
+            meta['dim_internal'] = parse_last_int(ln)
+        elif 'obs_centers' in ln:
+            meta['obs_centers'] = parse_tensor_like(ln)
+        elif 'obs_covs' in ln:
+            meta['obs_covs'] = parse_tensor_like(ln)
+        elif 'obs_vel' in ln:
+            meta['obs_vel'] = parse_tensor_like(ln)
+        elif 'state_lower_bound' in ln:
+            meta['state_lower_bound'] = parse_tensor_like(ln)
+        elif 'state_upper_bound' in ln:
+            meta['state_upper_bound'] = parse_tensor_like(ln)
+        elif 'controller_lower_bound' in ln or 'control_lower_bound' in ln:
+            meta['control_lower_bound'] = parse_tensor_like(ln)
+        elif 'controller_upper_bound' in ln or 'control_upper_bound' in ln:
+            meta['control_upper_bound'] = parse_tensor_like(ln)
+        elif 'rho value (learned roll-out)' in ln:
+            rho_str = ln.split(':')[-1].strip()
+            # "None" in the log means scheduled; numbers means fixed
+            meta['rho'] = None if 'None' in rho_str else parse_last_float(ln, None)
+    return meta
+
+def detect_ssm_size_from_checkpoint(ckpt_path: str, fallback: int = None) -> int:
+    if not os.path.exists(ckpt_path):
+        return int(fallback) if fallback is not None else 24
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+    # find actor sd
+    if isinstance(ckpt, (list, tuple)) and len(ckpt) >= 1 and isinstance(ckpt[0], dict):
+        actor_sd = ckpt[0]
+    elif isinstance(ckpt, dict):
+        if 'actor' in ckpt and isinstance(ckpt['actor'], dict):
+            actor_sd = ckpt['actor']
+        elif 'actor_state_dict' in ckpt and isinstance(ckpt['actor_state_dict'], dict):
+            actor_sd = ckpt['actor_state_dict']
+        elif 'state_dict' in ckpt and isinstance(ckpt['state_dict'], dict):
+            actor_sd = {k.split('actor_model.',1)[-1]: v for k, v in ckpt['state_dict'].items()
+                        if k.startswith('actor_model.')}
+            if not actor_sd: actor_sd = ckpt['state_dict']
+        else:
+            actor_sd = ckpt
     else:
-        return [(0.0, th_hi), (th_lo, 2*np.pi)]
+        actor_sd = ckpt
+
+    candidates = [
+        'm_dynamics.LRUR.B', 'm_dynamics.model.0.B',
+        'm_dynamics.LRUR.C', 'm_dynamics.model.0.C',
+        'm_dynamics.LRUR.state', 'm_dynamics.model.0.state',
+        'm_dynamics.LRUR.nu_log', 'm_dynamics.model.0.nu_log',
+        'm_dynamics.LRUR.theta_log', 'm_dynamics.model.0.theta_log',
+    ]
+    for key in candidates:
+        if key in actor_sd:
+            t = actor_sd[key]
+            shape = tuple(getattr(t, 'shape', getattr(t, 'size', lambda: ())) )
+            if not shape: shape = tuple(t.size())
+            if key.endswith('.B') and len(shape) == 2:  return int(shape[0])
+            if key.endswith('.C') and len(shape) == 2:  return int(shape[1])
+            if len(shape) == 1:                         return int(shape[0])
+    return int(fallback) if fallback is not None else 24
 
 # ---------------- 1) Create experiment folder ----------------
 RUN_DIR = Path(__file__).resolve().parent
@@ -120,7 +171,6 @@ now = datetime.now().strftime("%m_%d_%H_%M_%S")
 folder_name = f'PSF_SSM_NS_{now}'
 save_folder = (RUN_DIR / 'results' / folder_name)
 save_folder.mkdir(parents=True, exist_ok=True)
-BASE_DIR = str(RUN_DIR)
 
 # ---------------- 2) Set up logging ----------------
 log_filename = os.path.join(save_folder, 'training.log')
@@ -132,32 +182,63 @@ class WrapLogger:
     def info(self, msg): print(msg); self._l.info(msg)
 logger = WrapLogger(logger)
 
+# ---------------- 2bis) If RESUME, import meta + detect SSM and override env params ----
+resume_ckpt_path = None
+if START_MODE.lower() == "resume":
+    resume_dir = RUN_DIR / 'results' / RESUME_RUN_FOLDER
+    resume_ckpt_path = str(resume_dir / 'model_best.pth')
+    resume_log_path  = str(resume_dir / 'training.log')
+    if not os.path.exists(resume_ckpt_path):
+        raise FileNotFoundError(f"[RESUME] Missing checkpoint: {resume_ckpt_path}")
+
+    # detect ssm size
+    detected_k = detect_ssm_size_from_checkpoint(resume_ckpt_path, fallback=dim_internal)
+    if detected_k != dim_internal:
+        logger.info(f"[RESUME] Overriding dim_internal {dim_internal} → {detected_k}")
+        dim_internal = int(detected_k)
+
+    # override env hyperparams to match previous run (for identical behavior)
+    meta_old = load_meta_from_log(resume_log_path)
+    if 'sim_horizon' in meta_old: sim_horizon = int(meta_old['sim_horizon'])
+    if 'epsilon' in meta_old:      epsilon     = float(meta_old['epsilon'])
+
+    def _maybe_tensorize(x, like='double'):
+        if x is None: return None
+        arr = np.array(x, dtype=float)
+        ten = torch.tensor(arr, dtype=torch.double)
+        return ten
+
+    if 'obs_centers' in meta_old:       obs_centers = _maybe_tensorize(meta_old['obs_centers'])
+    if 'obs_covs' in meta_old:          obs_covs    = _maybe_tensorize(meta_old['obs_covs'])
+    if 'obs_vel' in meta_old:           obs_vel     = _maybe_tensorize(meta_old['obs_vel'])
+    #if 'state_lower_bound' in meta_old: state_lower_bound = _maybe_tensorize(meta_old['state_lower_bound'])
+    #if 'state_upper_bound' in meta_old: state_upper_bound = _maybe_tensorize(meta_old['state_upper_bound'])
+    #if 'control_lower_bound' in meta_old: control_lower_bound = _maybe_tensorize(meta_old['control_lower_bound'])
+    #if 'control_upper_bound' in meta_old: control_upper_bound = _maybe_tensorize(meta_old['control_upper_bound'])
+    #if 'rho' in meta_old:               rho = meta_old['rho']  # None (scheduled) or float
+
 # ---------------- 3) Log metadata ----------------
 logger.info("======= Experiment Metadata =======")
+logger.info(f"START_MODE               : {START_MODE}")
+if resume_ckpt_path: logger.info(f"RESUME_FROM              : {resume_ckpt_path}")
 logger.info(f"Simulation horizon (T)   : {sim_horizon}")
-logger.info(f"Noise amplitude          : {sampled_noise_}")
-logger.info(f"Number of epochs         : {num_epochs}")
 logger.info(f"Epsilon for PSF          : {epsilon}")
 logger.info(f"RENs dim_internal        : {dim_internal}")
 logger.info(f"obs_centers              : {obs_centers}")
 logger.info(f"obs_covs                 : {obs_covs}")
 logger.info(f"obs_vel                  : {obs_vel}")
-logger.info(f"Weight for state         : {loss_x_multiplier}")
-logger.info(f"Weight for control diff  : {loss_u_multiplier}")
-logger.info(f"Weight before loss_obs   : {loss_obs_multiplier}")
 logger.info(f"state_lower_bound        : {state_lower_bound}")
 logger.info(f"state_upper_bound        : {state_upper_bound}")
 logger.info(f"controller_lower_bound   : {control_lower_bound}")
 logger.info(f"controller_upper_bound   : {control_upper_bound}")
-logger.info(f"noise_std                : {noise_std}")
 logger.info(f"rho value (learned roll-out) : {rho}")
 logger.info("===================================")
 
 # ---------------- 4) Define the environment ----------------
 T_total = sim_horizon + 1 + 500
-t = torch.arange(T_total, dtype=obs_centers.dtype)
-obs_pos_raw = obs_centers + (t[:, None] * DT) * obs_vel   # (T_total, 2)
-obs_pos = obs_pos_raw.unsqueeze(0)                        # (1, T_total, 2)
+tvec = torch.arange(T_total, dtype=torch.double)
+obs_pos_raw = obs_centers + (tvec[:, None] * DT) * obs_vel  # (T_total, 2)
+obs_pos = obs_pos_raw.unsqueeze(0)                           # (1, T_total, 2)
 moving_obs = MovingObstacle(obs_pos, obs_covs)
 
 env = PendulumEnv(
@@ -168,18 +249,28 @@ env = PendulumEnv(
     control_limit_low=control_lower_bound.to(torch.double),
     control_limit_high=control_upper_bound.to(torch.double),
     alpha_state=loss_x_multiplier,
-    alpha_control=loss_u_multiplier,
+    alpha_control=loss_u_match_multiplier,
+    alpha_control_abs=loss_u_abs_multiplier,
     alpha_obst=loss_obs_multiplier,
     obstacle=moving_obs,
     obstacle_avoidance=True,
-    alpha_cer=alpha_cer,                  # Δu penalty weight
-    control_reward_regularization=True,   # enable Δu penalty
+    alpha_cer=alpha_cer,
+    control_reward_regularization=True,
+    obstacle_avoidance_loss_function="pdf99clip",
     epsilon=epsilon,
-    rho=rho,              # FIXED rho for learned roll-out
+    rho=rho,                # None -> scheduled, float -> fixed
     rho_bar=rho_bar,
     rho_max=rho_max,
     Qlyapunov=Qlyapunov,
-    Rlyapunov=Rlyapunov
+    Rlyapunov=Rlyapunov,
+    horizon = PSFhorizon,
+    final_convergence_window=(sim_horizon-30, sim_horizon),
+    convergence_theta_tol=0.1,
+    convergence_omega_tol=0.30,
+    convergence_hold_steps=5,
+    convergence_bonus=10.0,
+    use_ramped_state_weight=True,   # set True if you want early tracking deemphasized
+    state_weight_warmup=0.20
 )
 
 # ---------------- 5) MAD controller ----------------
@@ -200,33 +291,72 @@ mad_controller = MADController(
     nn_type=nn_type
 )
 
-# ---------------- Helper: deterministic evaluation over multiple inits ----------------
-def evaluate_policy(controller: MADController, n_inits: int = 5, timesteps: int = None) -> float:
-    """
-    Return the mean episodic return over n_inits random θ0 ∈ [theta0_low, theta0_high].
-    Uses controller.learned_policy (no OU noise) via get_trajectory.
-    """
-    if timesteps is None:
-        timesteps = sim_horizon
-    returns = []
-    for _ in range(n_inits):
-        th0 = float(np.random.uniform(theta0_low, theta0_high))
-        r_list, *_ = controller.get_trajectory(torch.tensor([[th0, 0.0]], dtype=torch.double), timesteps=timesteps)
-        returns.append(float(np.sum(r_list)))
-    return float(np.mean(returns))
+# ---------------- 5bis) Load weights if RESUME ----------------
+if START_MODE.lower() == "resume":
+    mad_controller.load_model_weight(resume_ckpt_path)
+    logger.info(f"[RESUME] Loaded weights from {resume_ckpt_path}")
 
-# ---------------- 6) (optional) Before-training roll-out ----------------
+# ---------------- Helpers: deterministic eval context ----------------
+from contextlib import contextmanager
+
+@contextmanager
+def deterministic_actor(controller: MADController):
+    """Temporarily disable OU noise and switch actor to eval() for reproducible rollouts."""
+    old_std = getattr(getattr(controller, 'ou_noise', None), 'std_dev', None)
+    if old_std is not None:
+        controller.ou_noise.std_dev = 0.0
+    was_training = controller.actor_model.training
+    controller.actor_model.eval()
+    torch.set_grad_enabled(False)
+    try:
+        yield
+    finally:
+        if old_std is not None:
+            controller.ou_noise.std_dev = old_std
+        controller.actor_model.train(was_training)
+        torch.set_grad_enabled(True)
+
+# ---------------- Helper: mean return over several θ0 (deterministic) ----
+def evaluate_policy(controller: MADController, n_inits: int = 5, timesteps: int = None) -> float:
+    if timesteps is None: timesteps = sim_horizon
+    scores = []
+    with deterministic_actor(controller):
+        for _ in range(n_inits):
+            th0 = float(np.random.uniform(theta0_low, theta0_high))
+            r_list, *_ = controller.get_trajectory(
+                torch.tensor([[th0, 0.0]], dtype=torch.double), timesteps=timesteps
+            )
+            scores.append(float(np.sum(r_list)))
+    return float(np.mean(scores)) if scores else -np.inf
+
+# ---------------- 6) Deterministic rollout BEFORE training ----------------
 before_prefix = os.path.join(save_folder, 'before_training')
-rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
-    torch.tensor([[start_position, 0.0]]), timesteps=sim_horizon+500
+with deterministic_actor(mad_controller):
+    rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
+        torch.tensor([[start_position, 0.0]]), timesteps=sim_horizon+500
+    )
+t_plot = min(sim_horizon, obs_pos_raw.shape[0]-1)
+plot_results(
+    obs_log[:,:sim_horizon+1,:],
+    u_log[:,:sim_horizon,:],
+    u_L_Log=u_L_log[:,:sim_horizon,:],
+    dt=env.sys.h,
+    length=env.sys.l,
+    plot_trj=False,
+    file_path=before_prefix,
+    obstacle_centers=obs_pos_raw[t_plot, :].unsqueeze(0),
+    obstacle_covs=torch.tensor([[obs_covs.item(), obs_covs.item()]], dtype=torch.double),
+    state_lower_bound=state_lower_bound.unsqueeze(0),
+    state_upper_bound=state_upper_bound.unsqueeze(0),
+    control_lower_bound=control_lower_bound.unsqueeze(0),
+    control_upper_bound=control_upper_bound.unsqueeze(0),
 )
-plot_instance = [86, 500 + sim_horizon]
 
 # ---------------- 7) Training with BEST checkpoint tracking ----------------
 best_score = -float("inf")
 best_path  = os.path.join(save_folder, "model_best.pth")
 
-# Initial eval before any training (so we can keep "best" if learning hurts)
+# Evaluate current model BEFORE any weight updates (deterministic)
 initial_eval = evaluate_policy(mad_controller, n_inits=5, timesteps=sim_horizon)
 logger.info(f"[Eval] Before training: mean return over 5 inits = {initial_eval:.2f}")
 best_score = initial_eval
@@ -235,25 +365,27 @@ logger.info(f"✓ Saved initial 'best' checkpoint → {best_path}")
 
 for epoch in range(num_epochs):
     mad_controller.train(total_episodes=1, episode_length=sim_horizon, logger=logger)
-    mad_controller.ou_noise.std_dev = max(0.1, mad_controller.ou_noise.std_dev * decayExpNoise)   # decay per epoch of exploration noise
 
-    # Evaluate deterministically (no OU) on a small batch of initial θ0
+    # decay exploration noise with a floor
+    if hasattr(mad_controller, "ou_noise") and hasattr(mad_controller.ou_noise, "std_dev"):
+        mad_controller.ou_noise.std_dev = max(0.1, mad_controller.ou_noise.std_dev * decayExpNoise)
+
+    # deterministic evaluation
     eval_return = evaluate_policy(mad_controller, n_inits=5, timesteps=sim_horizon)
     logger.info(f"[Eval] Epoch {epoch:03d}: mean return (5 inits) = {eval_return:.2f}")
 
-    # Keep only the best checkpoint
     if eval_return > best_score:
         best_score = eval_return
         mad_controller.save_model_weights(best_path)
         logger.info(f"✓ New best checkpoint (return={best_score:.2f}) → {best_path}")
 
-    # Optional intermediate plot
+    # Optional intermediate plot (deterministic)
     if epoch % 5 == 0:
         epoch_prefix = os.path.join(save_folder, f'epoch_{epoch:03d}')
-        rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
-            torch.tensor([[start_position, 0.0]]), timesteps=sim_horizon
-        )
-        t_plot = min(sim_horizon, obs_pos_raw.shape[0]-1)
+        with deterministic_actor(mad_controller):
+            rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
+                torch.tensor([[start_position, 0.0]]), timesteps=sim_horizon
+            )
         plot_results(
             obs_log[:,:sim_horizon+1,:],
             u_log[:,:sim_horizon,:],
@@ -273,57 +405,40 @@ for epoch in range(num_epochs):
 logger.info(f"Training complete. Best mean return = {best_score:.2f}")
 logger.info(f"Best checkpoint path: {best_path}")
 
-# ---------------- 8) Final rewards figure (with titles/axes) ----------------
+# ---------------- 8) Final rewards figure ----------------
 fig = plt.figure(figsize=(8, 5))
-plt.plot(range(1, num_epochs + 1), mad_controller.rewards_state_list, label=r'$Rewards_{x}$')
-plt.plot(range(1, num_epochs + 1), mad_controller.rewards_control_diff_list, label=r'$Rewards_{u}$')
-plt.plot(range(1, num_epochs + 1), mad_controller.rewards_obs_list, label=r'$Rewards_{obs}$')
-plt.plot(range(1, num_epochs + 1), mad_controller.rewards_list, label="Total Rewards")
-plt.ylim([-4000, 20])
-plt.xlabel("Episode")
-plt.ylabel("Reward")
-plt.title("Training Rewards (per episode)")
-plt.legend()
-plt.grid(True, alpha=0.3)
+plt.plot(range(1, len(mad_controller.rewards_state_list) + 1), mad_controller.rewards_state_list, label=r'$Rewards_{x}$')
+plt.plot(range(1, len(mad_controller.rewards_control_diff_list) + 1), mad_controller.rewards_control_diff_list, label=r'$Rewards_{u}$')
+plt.plot(range(1, len(mad_controller.rewards_obs_list) + 1), mad_controller.rewards_obs_list, label=r'$Rewards_{obs}$')
+plt.plot(range(1, len(mad_controller.rewards_list) + 1), mad_controller.rewards_list, label="Total Rewards")
+plt.ylim([-4000, 20]); plt.xlabel("Episode"); plt.ylabel("Reward")
+plt.title("Training Rewards (per episode)"); plt.legend(); plt.grid(True, alpha=0.3)
 plt.tight_layout()
 rewards_curve_path = os.path.join(save_folder, 'rewards_curve.png')
-fig.savefig(rewards_curve_path, dpi=300, bbox_inches='tight')
-plt.close(fig)
+fig.savefig(rewards_curve_path, dpi=300, bbox_inches='tight'); plt.close(fig)
 logger.info(f"Saved final rewards curve plot → {rewards_curve_path}")
-logger.info('------------ Training complete ------------')
 
-# ---------------- 9) Loss figures (titles/axes) ----------------
+# ---------------- 9) Loss figures ----------------
 fig = plt.figure(figsize=(7,4))
-plt.plot(mad_controller.actor_loss_list)
-plt.ylim([-10, 10000])
-plt.xlabel("Training step")
-plt.ylabel("Actor loss")
-plt.title("Actor loss during training")
-plt.grid(True, alpha=0.3)
+plt.plot(mad_controller.actor_loss_list); plt.ylim([-10, 10000])
+plt.xlabel("Training step"); plt.ylabel("Actor loss"); plt.title("Actor loss during training"); plt.grid(True, alpha=0.3)
 actor_loss_path = os.path.join(save_folder, 'actor_loss.png')
-fig.savefig(actor_loss_path, dpi=300, bbox_inches='tight')
-plt.close(fig)
+fig.savefig(actor_loss_path, dpi=300, bbox_inches='tight'); plt.close(fig)
 
 fig = plt.figure(figsize=(7,4))
-plt.plot(mad_controller.critic_loss_list)
-plt.ylim([-10, 10000])
-plt.xlabel("Training step")
-plt.ylabel("Critic loss")
-plt.title("Critic loss during training")
-plt.grid(True, alpha=0.3)
+plt.plot(mad_controller.critic_loss_list); plt.ylim([-10, 10000])
+plt.xlabel("Training step"); plt.ylabel("Critic loss"); plt.title("Critic loss during training"); plt.grid(True, alpha=0.3)
 critic_loss_path = os.path.join(save_folder, 'critic_loss.png')
-fig.savefig(critic_loss_path, dpi=300, bbox_inches='tight')
-plt.close(fig)
+fig.savefig(critic_loss_path, dpi=300, bbox_inches='tight'); plt.close(fig)
 
-# ---------------- 10) After-training roll-out for comparison plots ----------------
-# IMPORTANT: Reload the BEST checkpoint before plotting
+# ---------------- 10) After-training roll-out for comparison plots (deterministic) ----
 mad_controller.load_model_weight(best_path)
-
 after_prefix = os.path.join(save_folder, 'after_training')
-rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
-    torch.tensor([[start_position, 0.0]]), timesteps=sim_horizon+500
-)
-for tN in plot_instance:
+with deterministic_actor(mad_controller):
+    rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
+        torch.tensor([[start_position, 0.0]]), timesteps=sim_horizon+500
+    )
+for tN in [86, 500 + sim_horizon]:
     plot_results(
         obs_log[:,:tN+1,:],
         u_log[:,:tN,:],
@@ -339,9 +454,8 @@ for tN in plot_instance:
         control_lower_bound=control_lower_bound.unsqueeze(0),
         control_upper_bound=control_upper_bound.unsqueeze(0),
     )
-logger.info(f"Saved 'after training' plots into {after_prefix}/*")
 
-# Save metrics
+# ---------------- 11) Save metrics ----------------
 rewards            = np.array(mad_controller.rewards_list)
 rewards_state      = np.array(mad_controller.rewards_state_list)
 rewards_control    = np.array(mad_controller.rewards_control_diff_list)
@@ -364,253 +478,3 @@ np.savez_compressed(
     actor_losses=actor_losses,
     critic_losses=critic_losses
 )
-
-# =====================================================================
-# 11) Closed-loop comparisons (forward simulation, logging J*)
-#     Plots: θ(t) + obstacle band, ρ_t, J*(t)
-# =====================================================================
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
-
-from single_pendulum_sys import SinglePendulum, SinglePendulumCasadi
-from PSF import MPCPredictSafetyFilter
-
-# --- Make sure Matplotlib does NOT call external LaTeX (fixes crashes) ---
-mpl.rcParams['text.usetex'] = False  # use mathtext, not LaTeX
-
-# ---- helpers (same geometry as run_prestabilizedSys) -----------------
-CHI2_2_95 = 5.991464547  # 95% quantile for chi-square with 2 dof
-OBSTACLE_SHADE_COLOR = (0.95, 0.55, 0.55, 0.35)  # soft red
-
-SAFE_TH_LO = float(state_lower_bound[0].item())
-SAFE_TH_HI = float(state_upper_bound[0].item())
-
-DT = float(env.sys.h)
-T_STEPS = int(sim_horizon)  # number of input steps (states have T_STEPS+1 samples)
-HORIZON = 25                # PSF horizon for these replays (tune if needed)
-
-# Angle wrap to [0, 2π)
-def wrap_0_2pi(x):
-    return np.mod(x, 2*np.pi)
-
-# Compute θ-intervals that make the tip intersect a circular obstacle (95%)
-def theta_arcs_hit_obstacle(center_xy, L, cov_var):
-    # 95% radius for isotropic Gaussian with variance 'cov_var'
-    r = np.sqrt(CHI2_2_95 * cov_var)
-    c = np.asarray(center_xy, dtype=float).reshape(2,)
-    norm_c = np.linalg.norm(c)
-    if norm_c < 1e-12:
-        return [(0.0, 2*np.pi)]  # centered on pivot -> full circle
-
-    # Tip moves on circle of radius L centered at origin. Obstacle is circle (center c, radius r).
-    # Let α be the angle on the tip circle; θ = α + π/2. Intersection condition:
-    zeta = (L**2 + norm_c**2 - r**2) / (2.0 * L * norm_c)
-    if zeta <= -1.0:
-        return [(0.0, 2*np.pi)]
-    if zeta >=  1.0:
-        return []
-
-    delta = np.arccos(zeta)          # half width in α
-    phi   = np.arctan2(c[1], c[0])   # center direction
-    alpha_lo, alpha_hi = phi - delta, phi + delta
-    # Convert back to θ = α + π/2 and wrap
-    th_lo = wrap_0_2pi(alpha_lo + np.pi/2)
-    th_hi = wrap_0_2pi(alpha_hi + np.pi/2)
-    if th_lo <= th_hi:
-        return [(th_lo, th_hi)]
-    else:
-        return [(0.0, th_hi), (th_lo, 2*np.pi)]
-
-# External copy of the smooth schedule used inside PSF (for plotting ρ_t)
-def rho_schedule_from_uL(uL_scalar, rho_bar, rho_max, epsilon):
-    # same as PSF.py: sigma = ||uL||^2 / (ε^2 + ||uL||^2)
-    r2 = float(uL_scalar**2)
-    sigma = r2 / (epsilon*epsilon + r2)
-    return float(rho_bar + (rho_max - rho_bar) * sigma)
-
-# ---- build obstacle centers along time (same as your env/moving_obs) --
-obs_centers_np = obs_centers.detach().cpu().numpy()
-obs_vel_np     = obs_vel.detach().cpu().numpy()
-def obstacle_centers_at_step(k: int):
-    return obs_centers_np + (k * DT) * obs_vel_np  # shape (n_obs, 2)
-
-# ---- Common PSF model/plant ingredients --------------------------------
-xbar = np.array([np.pi, 0.0], dtype=float)
-U_MIN = float(control_lower_bound.item())
-U_MAX = float(control_upper_bound.item())
-
-Q = Qlyapunov
-R = Rlyapunov
-EPSILON = float(epsilon)
-RHO_MAX = float(rho_max)
-
-def simulate_closed_loop(uL_seq,  # array shape (T_STEPS, 1) OR callable(t, x) -> np.ndarray([1])
-                         rho_fixed=None,  # if None -> scheduler ON; else scalar fixed ρ
-                         title_suffix=""):
-    """
-    Runs PSF + plant forward, logs θ, ρ_t (for plotting), J*(t), feasibility.
-    If uL_seq is callable, it is evaluated at each step with (t, x_t) to produce u_L,t.
-    """
-    # CasADi model for PSF + torch plant
-    model = SinglePendulumCasadi(xbar=xbar.copy())
-    L_link = float(model.l)
-    plant = SinglePendulum(
-        xbar=torch.tensor(xbar, dtype=torch.double),
-        x_init=torch.tensor([start_position, 0.0], dtype=torch.double).view(1, -1),
-        u_init=torch.zeros(1, 1, dtype=torch.double),
-    )
-
-    psf = MPCPredictSafetyFilter(
-        model,
-        horizon=HORIZON,
-        state_lower_bound=state_lower_bound.numpy().astype(float),
-        state_upper_bound=state_upper_bound.numpy().astype(float),
-        control_lower_bound=control_lower_bound.numpy().astype(float),
-        control_upper_bound=control_upper_bound.numpy().astype(float),
-        Q=Q, R=R, solver_opts=None,
-        set_lyacon=True,
-        epsilon=EPSILON,
-        rho=rho_fixed,         # None -> scheduled, scalar -> fixed-ρ
-        rho_bar=float(rho_bar),
-        rho_max=RHO_MAX,
-    )
-
-    theta_log = [float(start_position)]
-    rho_log   = []
-    Jstar_log = []
-    feas_log  = []
-
-    U_prev = None
-    X_prev = None
-    x_t = torch.tensor([start_position, 0.0], dtype=torch.double).view(1,1,-1)
-
-    for t in range(T_STEPS):
-        x_np = x_t.detach().cpu().numpy().reshape(-1)
-
-        # get u_L,t
-        if callable(uL_seq):
-            uL = np.asarray(uL_seq(t, x_np), dtype=float).reshape(1,)
-        else:
-            # use provided sequence (from learned rollout)
-            uL = np.asarray(uL_seq[t, :], dtype=float).reshape(1,)
-
-        # solve PSF at current state
-        try:
-            if t == 0:
-                U_sol, X_sol, J_curr = psf.solve_mpc(x_np, xbar, uL)
-            else:
-                U_sol, X_sol, J_curr = psf.solve_mpc(x_np, xbar, uL, U_prev, X_prev)
-        except Exception:
-            U_sol, X_sol, J_curr = None, None, None
-
-        if U_sol is None or X_sol is None:
-            # Infeasible: pass-through uL; drop warm start
-            u_cmd = uL.copy().reshape(1,1,1)
-            U_prev, X_prev = None, None
-            feas_log.append(False)
-            Jstar_log.append(np.nan)
-        else:
-            # Apply first move and keep warm start for next step
-            u_cmd = U_sol[:, 0:1].reshape(1,1,1)
-            U_prev, X_prev = U_sol, X_sol
-            feas_log.append(True)
-            Jstar_log.append(float(J_curr))
-
-        # log ρ_t used (for plotting)
-        if rho_fixed is None:
-            rho_log.append(rho_schedule_from_uL(uL[0], rho_bar=float(rho_bar), rho_max=RHO_MAX, epsilon=EPSILON))
-        else:
-            rho_log.append(float(rho_fixed))
-
-        # plant step (filtered control)
-        x_t = plant.rk4_integration(x_t, torch.tensor(u_cmd, dtype=torch.double))
-        theta_log.append(float(x_t.view(-1)[0]))
-
-    return (np.array(theta_log), np.array(rho_log), np.array(Jstar_log), np.array(feas_log), L_link)
-
-# ---- Build uL sequence for the "learned" run from logs (from best model rollout) ----
-# Use the u_L sequence from the AFTER-TRAINING rollout above (best model loaded)
-obs_arr_sec, uL_arr_sec, u_arr_sec = unpack_logs(obs_log, u_L_log, u_log)
-uL_learn_seq = np.asarray(uL_arr_sec[:int(sim_horizon), :], dtype=float)   # shape (T_STEPS, 1)
-
-# 1) Baseline: fixed rho=0.5, u_L=0
-uL_zero = np.zeros_like(uL_learn_seq)
-theta_base, rho_base, J_base, feas_base, L_link = simulate_closed_loop(
-    uL_seq=uL_zero, rho_fixed=0.5, title_suffix="(baseline)"
-)
-
-# 2) Learned: scheduled rho (rho=None), actor’s u_L from the rollout
-theta_learn_arr, rho_learn, J_learn, feas_learn, _ = simulate_closed_loop(
-    uL_seq=uL_learn_seq, rho_fixed=None, title_suffix="(learned)"
-)
-
-# ---- time axes ----------------------------------------------------------
-t_states = np.arange(int(sim_horizon) + 1) * DT
-t_inputs = np.arange(int(sim_horizon)) * DT
-
-# ---- Figure 1: θ(t) with obstacle bands + reference ---------------------
-fig1, ax1 = plt.subplots(figsize=(10, 4.8))
-ax1.plot(t_states[:theta_base.shape[0]],  theta_base,  label=r'PSF-only ($\bar{\rho}=0.5$, $u_L\equiv 0$)', lw=1.4)
-ax1.plot(t_states[:theta_learn_arr.shape[0]], theta_learn_arr, label=r'Trained policy + PSF (scheduled $\rho_t$)', lw=1.4)
-ax1.axhline(np.pi, linestyle='--', linewidth=1.0, color='k', label=r'$\theta^\star=\pi$')
-ax1.set_title(r"Pendulum angle $\theta(t)$ with obstacle (95%)")
-ax1.set_xlabel("time [s]")
-ax1.set_ylabel(r"$\theta$ [rad]")
-ax1.set_ylim([SAFE_TH_LO-0.1, SAFE_TH_HI+0.1])
-ax1.grid(True, alpha=0.3)
-
-# obstacle shading (95%) per step using arcs
-for k in range(int(sim_horizon)):
-    centers_k = obstacle_centers_at_step(k)  # (n_obs, 2)
-    for i in range(centers_k.shape[0]):
-        arcs = theta_arcs_hit_obstacle(centers_k[i], L_link, cov_var=float(obs_covs[i]))
-        if not arcs:
-            continue
-        x_span = [k*DT, (k+1)*DT]
-        for (th_lo, th_hi) in arcs:
-            ax1.fill_between(x_span, [th_lo, th_lo], [th_hi, th_hi],
-                             facecolor=OBSTACLE_SHADE_COLOR, edgecolor='none', linewidth=0.0, zorder=0)
-
-ax1.axhline(SAFE_TH_LO, color='k', lw=0.8, ls=':')
-ax1.axhline(SAFE_TH_HI, color='k', lw=0.8, ls=':')
-handles, labels = ax1.get_legend_handles_labels()
-handles.append(Patch(facecolor=OBSTACLE_SHADE_COLOR, edgecolor='none', label='Obstacle (95%)'))
-ax1.legend(handles=handles, loc='best')
-
-theta_obs_path = os.path.join(save_folder, 'comparison_theta_obstacle.png')
-fig1.tight_layout()
-fig1.savefig(theta_obs_path, dpi=300, bbox_inches='tight')
-plt.close(fig1)
-
-# ---- Figure 2: ρ_t (learned vs baseline) --------------------------------
-fig2, ax2 = plt.subplots(figsize=(10, 4.6))
-ax2.plot(t_inputs[:rho_base.shape[0]],  rho_base,  label=r'PSF-only $\rho_t$ (baseline)', lw=1.4)
-ax2.plot(t_inputs[:rho_learn.shape[0]], rho_learn, label=r'Learned policy $\rho_t$ (scheduled)', lw=1.4)
-ax2.set_title(r"Tightening schedule $\rho_t$")
-ax2.set_xlabel("time [s]")
-ax2.set_ylabel(r"$\rho_t$")
-ax2.grid(True, alpha=0.3)
-ax2.legend(loc='best')
-
-rho_path = os.path.join(save_folder, 'comparison_rho.png')
-fig2.tight_layout()
-fig2.savefig(rho_path, dpi=300, bbox_inches='tight')
-plt.close(fig2)
-
-# ---- Figure 3: J*(t) (learned vs baseline) ------------------------------
-fig3, ax3 = plt.subplots(figsize=(10, 4.6))
-ax3.plot(t_inputs[:J_base.shape[0]],  J_base,  label=r'PSF-only $J^\star$ (baseline)', lw=1.4)
-ax3.plot(t_inputs[:J_learn.shape[0]], J_learn, label=r'Learned policy $J^\star$', lw=1.4)
-ax3.set_title(r"Optimal value $J^\star$ per PSF solve")
-ax3.set_xlabel("time [s]")
-ax3.set_ylabel(r"$J^\star$")
-ax3.grid(True, alpha=0.3)
-ax3.legend(loc='best')
-
-jstar_path = os.path.join(save_folder, 'comparison_Jstar.png')
-fig3.tight_layout()
-fig3.savefig(jstar_path, dpi=300, bbox_inches='tight')
-plt.close(fig3)
-
-logger.info(f"Saved comparison plots →\n  {theta_obs_path}\n  {rho_path}\n  {jstar_path}")

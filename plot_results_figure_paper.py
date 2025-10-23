@@ -35,7 +35,7 @@ from PSF import MPCPredictSafetyFilter
 
 # =================== HYPERPARAMETERS / USER SETTINGS =================
 # --- Run / model selection ---
-RUN_FOLDER_NAME    = "PSF_SSM_NS_10_23_21_33_23"  # results/<RUN_FOLDER_NAME>
+RUN_FOLDER_NAME    = "PSF_SSM_NS_10_22_12_30_21"  # results/<RUN_FOLDER_NAME>
 THETA0             = 1.57079632679                # single run initial angle [rad]; None -> π/2
 RHO_FIXED          = 0.5                          # baseline (and optional learned) fixed ρ
 LEARNED_RHO_MODE   = "scheduled"                  # "scheduled" or "fixed"
@@ -50,8 +50,8 @@ PLOT_SHARED_ANCHOR   = True
 # --- θ0 sweep (FIRST plot overlay only) ---
 ENABLE_THETA0_SWEEP     = True     # set False to disable overlay
 THETA0_MIN              = -2.6+3.14      # radians
-THETA0_MAX              = -0.7+3.14      # radians
-THETA0_N                = 5        # number of θ0 samples in [min,max]
+THETA0_MAX              = -0.75+3.14      # radians
+THETA0_N                = 12        # number of θ0 samples in [min,max]
 PLOT_BASELINE_IN_SWEEP  = True     # overlay PSF-only curves (baseline)
 PLOT_LEARNED_IN_SWEEP   = True     # overlay Actor+PSF curves (learned)
 rho_bar     = 0.5
