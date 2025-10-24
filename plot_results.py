@@ -35,7 +35,7 @@ from PSF import MPCPredictSafetyFilter
 
 # =================== HYPERPARAMETERS / USER SETTINGS =================
 # --- Run / model selection ---
-RUN_FOLDER_NAME    = "PSF_SSM_NS_10_23_21_33_23"  # results/<RUN_FOLDER_NAME>
+RUN_FOLDER_NAME    = "PSF_SSM_NS_10_24_00_02_54"  # results/<RUN_FOLDER_NAME>
 THETA0             = 1.57079632679                # single run initial angle [rad]; None -> π/2
 RHO_FIXED          = 0.5                          # baseline (and optional learned) fixed ρ
 LEARNED_RHO_MODE   = "scheduled"                  # "scheduled" or "fixed"

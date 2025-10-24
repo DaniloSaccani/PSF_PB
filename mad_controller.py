@@ -272,6 +272,7 @@ class Actor(nn.Module):
         super(Actor, self).__init__()
         self.control_action_upper_bound = control_action_upper_bound
         self.nn_type = nn_type
+        self.dir_gain = nn.Parameter(torch.ones(1, num_actions))
 
         self.direction_mlp = nn.Sequential(
             nn.Linear(num_states, hidden_dim, bias=False),
@@ -353,6 +354,7 @@ class Actor(nn.Module):
                 dynamics_disturbance_output = self.m_dynamics(dynamics_disturbance)
                 m_term = dynamics_disturbance_output.squeeze(0)[-1, :]
                 d_term = torch.tanh(direction_term) * self.control_action_upper_bound
+                d_term = self.dir_gain * d_term  # <-- NEW: scale direction by learnable gain
                 action = (m_term) * d_term
                 if action.dim() == 1:
                     action = action.unsqueeze(0)
@@ -745,6 +747,7 @@ class MADController:
             self.episode_count += 1
             self.ou_noise.reset()
             self.state = self.env.reset().to(device)
+            self.last_episode_ic = self.env.state.squeeze(0).squeeze(0).detach().cpu().clone()
             self.dynamics_states_real = torch.cat(
                 [
                     self.actor_model.m_dynamics.LRUR.states_last.real.squeeze(),
@@ -981,18 +984,34 @@ class MADController:
     def load_model_weight(self, filename):
         """
         Loads the weights of the model (actor, critic, and optimizers) from a file.
-
-        Args:
-            filename (str): The path to load the model weights from.
+        Backward-compatible: new params (e.g., dir_gain) are initialized if missing.
         """
-        self.actor_model.load_state_dict(torch.load(filename)[0])
-        self.critic_model.load_state_dict(torch.load(filename)[1])
-        self.target_actor.load_state_dict(torch.load(filename)[2])
-        self.target_critic.load_state_dict(torch.load(filename)[3])
-        self.actor_optimizer.load_state_dict(torch.load(filename)[4])
-        self.critic_optimizer.load_state_dict(torch.load(filename)[5])
-        self.actor_model.m_dynamics.load_state_dict(torch.load(filename)[6])
-        self.target_actor.m_dynamics.load_state_dict(torch.load(filename)[7])
+        ckpt = torch.load(filename)
+
+        # 0: actor, 1: critic, 2: target_actor, 3: target_critic,
+        # 4: actor_opt, 5: critic_opt, 6: actor.m_dynamics, 7: target_actor.m_dynamics
+        self.actor_model.load_state_dict(ckpt[0], strict=False)  # <-- strict=False
+        self.critic_model.load_state_dict(ckpt[1], strict=False)
+        self.target_actor.load_state_dict(ckpt[2], strict=False)
+        self.target_critic.load_state_dict(ckpt[3], strict=False)
+
+        # SSM submodules (safe either way)
+        if len(ckpt) > 6:
+            self.actor_model.m_dynamics.load_state_dict(ckpt[6], strict=False)
+        if len(ckpt) > 7:
+            self.target_actor.m_dynamics.load_state_dict(ckpt[7], strict=False)
+
+        # Optimizers: best-effort load; if it fails (old runs), re-init silently
+        try:
+            self.actor_optimizer.load_state_dict(ckpt[4])
+        except Exception as e:
+            print(f"[load_model_weight] actor optimizer mismatch -> reinit ({e})")
+
+        try:
+            self.critic_optimizer.load_state_dict(ckpt[5])
+        except Exception as e:
+            print(f"[load_model_weight] critic optimizer mismatch -> reinit ({e})")
+
         print(f"DDPG Model weights loaded from {filename} successfully.")
 
 
