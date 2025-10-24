@@ -13,7 +13,7 @@ Run: python make_pendulum_gif_single.py
 
 # =================== USER SETTINGS (manual, like your plot script) ===================
 RUN_FOLDER_NAME    = "PSF_SSM_NS_10_24_00_02_54"  # results/<RUN_FOLDER_NAME>
-THETA0             = -1.5+3.14 #1.57079632679                # initial angle [rad]; None -> π/2
+THETA0             = -0.7+3.14 #1.57079632679                # initial angle [rad]; None -> π/2
 LEARNED_RHO_MODE   = "scheduled"                  # "scheduled" or "fixed"
 RHO_FIXED          = 0.5                          # used only if LEARNED_RHO_MODE == "fixed"
 
