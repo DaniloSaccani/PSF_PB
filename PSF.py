@@ -18,11 +18,13 @@ class MPCPredictSafetyFilter:
             R=None,
             solver_opts=None,
             set_lyacon=False,
-            periodic_info = False,
-            epsilon = 0.05,
-            rho = None,
+            periodic_info=False,
+            epsilon=0.05,
+            rho=None,
             rho_bar=None,
-            rho_max = None
+            rho_max=None,
+            # --- NEW ---
+            solver_tol=1e-7  # Tolerance for equality constraints
     ):
         self.model_func = model.noiseless_forward
         self.xbar = model.xbar
@@ -45,6 +47,10 @@ class MPCPredictSafetyFilter:
             self.rho_max = 2.0
         else:
             self.rho_max = rho_max
+
+        # --- NEW ---
+        self.solver_tol = solver_tol
+        # --- END NEW ---
 
         R = R if R is not None else np.eye(self.nu)
         Q = Q if Q is not None else np.eye(self.nx)
@@ -86,14 +92,20 @@ class MPCPredictSafetyFilter:
         self.penalty_term = self.opti.parameter(1)
 
         # Define the intial bounds and terminal bounds
-        self.opti.subject_to(self.X[:, 0] == self.x0)
-
-
+        # --- MODIFIED: Relax equality constraint ---
+        self.opti.subject_to(
+            self.opti.bounded(-self.solver_tol, self.X[:, 0] - self.x0, self.solver_tol)
+        )
+        # --- END MODIFIED ---
 
         # Define the dynamics and constraints
         for k in range(self.horizon):
             x_next = self.model_func(self.X[:, k], self.U[:, k])
-            self.opti.subject_to(self.X[:, k + 1] == x_next)
+            # --- MODIFIED: Relax equality constraint ---
+            self.opti.subject_to(
+                self.opti.bounded(-self.solver_tol, self.X[:, k + 1] - x_next, self.solver_tol)
+            )
+            # --- END MODIFIED ---
 
             self.opti.subject_to(self.opti.bounded(self.ulb, self.U[:, k], self.uub))
             if k > 0:
@@ -124,39 +136,44 @@ class MPCPredictSafetyFilter:
 
             # At k = horizon
             delta_theta_T = ca.atan2(
-                    ca.sin(self.X[0, self.horizon] - self.xbar[0]),
-                    ca.cos(self.X[0, self.horizon] - self.xbar[0])
-                )
+                ca.sin(self.X[0, self.horizon] - self.xbar[0]),
+                ca.cos(self.X[0, self.horizon] - self.xbar[0])
+            )
             error_omega_T = self.X[1, self.horizon] - self.xbar[1]
             err_vec_T = ca.vertcat(delta_theta_T, error_omega_T)
-            #J_curr += ca.mtimes([err_vec_T.T, self.P, err_vec_T])
+            # J_curr += ca.mtimes([err_vec_T.T, self.P, err_vec_T])
 
             # Terminal set constraint
-            self.opti.subject_to(self.X[:, self.horizon] == self.xbar)
-            #eps_term = 1e-3  # tune
-            #self.opti.subject_to(ca.mtimes([err_vec_T.T, self.P, err_vec_T]) <= eps_term)
+            # --- MODIFIED: Relax equality constraint ---
+            self.opti.subject_to(
+                self.opti.bounded(-self.solver_tol, self.X[:, self.horizon] - self.xbar, self.solver_tol)
+            )
+            # --- END MODIFIED ---
+
+            # eps_term = 1e-3  # tune
+            # self.opti.subject_to(ca.mtimes([err_vec_T.T, self.P, err_vec_T]) <= eps_term)
             # with slack
-            #s = self.opti.variable(1)
-            #self.opti.subject_to(s >= 0)
-            #self.opti.subject_to(ca.mtimes([err_vec_T.T, self.P, err_vec_T]) <= eps_term + s)
-            #mu = 1e3
+            # s = self.opti.variable(1)
+            # self.opti.subject_to(s >= 0)
+            # self.opti.subject_to(ca.mtimes([err_vec_T.T, self.P, err_vec_T]) <= eps_term + s)
+            # mu = 1e3
 
             if self.rho is None:
-                #r = ca.norm_2(self.uL)  # ||u_L,t||
-                #ratio = (r - self.epsilon) / self.epsilon
-                #ratio_clipped = ca.fmax(0, ca.fmin(1, ratio))  # in [0,1]
-                #rho = self.rho_bar + (self.rho_max - self.rho_bar) * ratio_clipped
+                # r = ca.norm_2(self.uL)  # ||u_L,t||
+                # ratio = (r - self.epsilon) / self.epsilon
+                # ratio_clipped = ca.fmax(0, ca.fmin(1, ratio))  # in [0,1]
+                # rho = self.rho_bar + (self.rho_max - self.rho_bar) * ratio_clipped
 
                 # --- replace your scheduler block with this ---
-                #beta = 5.0  # modest slope; larger is fine now, but start modest
+                # beta = 5.0  # modest slope; larger is fine now, but start modest
 
-                #def softplus_stable(x):  # smooth and overflow-safe
+                # def softplus_stable(x):  # smooth and overflow-safe
                 #    return ca.if_else(x > 0, x + ca.log(1 + ca.exp(-x)), ca.log(1 + ca.exp(x)))
 
-                #z = (ca.norm_2(self.uL) - self.epsilon) / self.epsilon
-                #pos = softplus_stable(beta * z) / beta  # >= 0, no overflow
-                #sigma = 1 - ca.exp(-pos)  # in (0,1), stable even for large pos
-                #rho = self.rho_bar + (self.rho_max - self.rho_bar) * sigma
+                # z = (ca.norm_2(self.uL) - self.epsilon) / self.epsilon
+                # pos = softplus_stable(beta * z) / beta  # >= 0, no overflow
+                # sigma = 1 - ca.exp(-pos)  # in (0,1), stable even for large pos
+                # rho = self.rho_bar + (self.rho_max - self.rho_bar) * sigma
 
                 ratio = ca.sumsqr(self.uL) / (self.epsilon * self.epsilon)  # ≥ 0, smooth at 0
                 sigma = ratio / (1 + ratio)  # maps [0,∞) → (0,1), C∞
@@ -168,7 +185,7 @@ class MPCPredictSafetyFilter:
         # Define the cost function
         reg_u = 1e-4 * ca.sumsqr(self.U)  # tiny!
         reg_x = 1e-6 * ca.sumsqr(self.X)  # tinier!
-        stage_cost = ca.sumsqr(self.U[:, 0] - self.uL) #  + reg_u + reg_x
+        stage_cost = ca.sumsqr(self.U[:, 0] - self.uL)  # + reg_u + reg_x
         self.opti.minimize(stage_cost)
 
         # Define the solver options
@@ -211,17 +228,16 @@ class MPCPredictSafetyFilter:
             om_path = om0 + tgrid * (omT - om0)
             X_guess = np.vstack([th_path, om_path])  # shape (2, N+1)
 
-
             self.opti.set_initial(self.X, X_guess)
             # in solve_mpc() when u_prev/x_prev is None
             self.opti.set_initial(self.U, np.tile(uL_val.reshape(-1, 1), (1, self.horizon)))
 
-            #self.opti.set_initial(self.U, np.tile(self.uub.reshape(-1, 1), (1, self.horizon)))
+            # self.opti.set_initial(self.U, np.tile(self.uub.reshape(-1, 1), (1, self.horizon)))
 
             J_prev = 1e7
             penalty_term = 0
         else:
-            J_prev = self.quadcost(x_prev, u_prev, xbar_val.reshape(2,))
+            J_prev = self.quadcost(x_prev, u_prev, xbar_val.reshape(2, ))
 
             th0 = x_prev[0, 0]
             th_ref = xbar_val[0]
@@ -232,7 +248,7 @@ class MPCPredictSafetyFilter:
             u0 = u_prev[:, 0]  # shape=(1,)
             penalty_term += u0.T @ np.array(self.R) @ u0
 
-            x_prev = np.append(x_prev[:, 1:], xbar_val.reshape(2,1), axis=1)
+            x_prev = np.append(x_prev[:, 1:], xbar_val.reshape(2, 1), axis=1)
             u_prev = np.append(u_prev[:, 1:], np.array([[0]]), axis=1)
 
             self.opti.set_initial(self.X, np.array(x_prev))

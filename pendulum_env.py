@@ -9,50 +9,67 @@ import loss_function as lf
 from PSF import MPCPredictSafetyFilter
 from single_pendulum_sys import SinglePendulum, SinglePendulumCasadi
 
+
 class PendulumEnv:
     def __init__(self,
-        x0 = torch.tensor([0.0, 0.0]),
-        target_positions = np.array([np.pi, 0]),
-        obstacle=None,
-        obstacle_avoidance_loss_function="pdf99clip", #before "pdf"
-        prestabilized=True,
-        disturbance=True,
-        nonlinear_damping=True,
-        obstacle_avoidance=False,
-        collision_avoidance=False,
-        control_reward_regularization=False,
-        initial_state_low=None,
-        initial_state_high=None,
-        state_limit_low=None,
-        state_limit_high=None,
-        control_limit_low=None,
-        control_limit_high=None,
-        epsilon = 0.05,
-        alpha_obst = 1,
-        alpha_control = 1,
-        alpha_control_abs=0.0,
-        alpha_state = 1,
-        alpha_ca = 1,
-        alpha_cer = 1,
-        rho = None,
-        rho_bar = None,
-        rho_max = None,
-        Qlyapunov=None,
-        Rlyapunov=None,
-        Q = None,
-        R = None,
-        horizon=None,
-        final_convergence_window=(220, 250),  # (t0, t1) in sim steps
-        convergence_theta_tol=0.08,  # rad, ~4.6°
-        convergence_omega_tol=0.30,  # rad/s
-        convergence_hold_steps=5,  # require K consecutive steps
-        convergence_bonus=5.0,  # per-step bonus scale
-        # --- OPTIONAL: de-emphasize early tracking ---
-        use_ramped_state_weight = False,
-        state_weight_warmup = 0.20
-    ):
-        self.n = 2
-        self.m = 1
+                 x0=torch.tensor([0.0, 0.0]),
+                 target_positions=np.array([np.pi, 0]),
+                 obstacle=None,
+                 obstacle_avoidance_loss_function="pdf99clip",  # before "pdf"
+                 prestabilized=True,
+                 disturbance=True,
+                 nonlinear_damping=True,
+                 obstacle_avoidance=False,
+                 collision_avoidance=False,
+                 control_reward_regularization=False,
+                 initial_state_low=None,
+                 initial_state_high=None,
+                 state_limit_low=None,
+                 state_limit_high=None,
+                 control_limit_low=None,
+                 control_limit_high=None,
+                 epsilon=0.05,
+                 alpha_obst=1,
+                 alpha_control=1,
+                 alpha_control_abs=0.0,
+                 alpha_state=1,
+                 alpha_ca=1,
+                 alpha_cer=1,
+                 rho=None,
+                 rho_bar=None,
+                 rho_max=None,
+                 Qlyapunov=None,
+                 Rlyapunov=None,
+                 Q=None,
+                 R=None,
+                 horizon=None,
+                 final_convergence_window=(220, 250),  # (t0, t1) in sim steps
+                 convergence_theta_tol=0.08,  # rad, ~4.6°
+                 convergence_omega_tol=0.30,  # rad/s
+                 convergence_hold_steps=5,  # require K consecutive steps
+                 convergence_bonus=5.0,  # per-step bonus scale
+                 # --- OPTIONAL: de-emphasize early tracking ---
+                 use_ramped_state_weight=False,
+                 state_weight_warmup=0.20,
+                 # --- MODIFIED: Added for augmented state ---
+                 sim_horizon=250,
+                 obs_vel=None
+                 ):
+        self.n = 2  # physical state dim
+        self.m = 1  # control dim
+
+        # --- MODIFIED: Context dims ---
+        # context = [phi_t, obs_pos_x, obs_pos_y, obs_vel_x, obs_vel_y]
+        self.context_n = 1 + 2 + 2
+        self.aug_n = self.n + self.context_n  # augmented state dim
+        self.sim_horizon = float(sim_horizon)
+        if obs_vel is None:
+            self.obs_vel = torch.tensor([0.0, 0.0], dtype=torch.double)
+        else:
+            # Assuming 1 obstacle for simplicity, matching run.py
+            self.obs_vel = obs_vel.reshape(-1).to(torch.double)
+        # --- END MODIFIED ---
+
         self.prestabilized = prestabilized
         self.disturbance = disturbance
         self.nonlinear_damping = nonlinear_damping
@@ -126,40 +143,42 @@ class PendulumEnv:
         # Target (equilibrium)
         self.target_positions = torch.tensor(target_positions, dtype=torch.double)
 
-        # Limits
-        if initial_state_low  is None: initial_state_low  = -1 * torch.ones((self.n,), dtype=torch.double)
-        if initial_state_high is None: initial_state_high =  1 * torch.ones((self.n,), dtype=torch.double)
-        if state_limit_low    is None: state_limit_low    = torch.tensor([0.5, -np.inf], dtype=torch.double)
-        if state_limit_high   is None: state_limit_high   = torch.tensor([2*np.pi-0.5, np.inf], dtype=torch.double)
-        if control_limit_low  is None: control_limit_low  = torch.tensor([-3.0], dtype=torch.double)
-        if control_limit_high is None: control_limit_high = torch.tensor([ 3.0], dtype=torch.double)
+        # Limits (for physical state)
+        if initial_state_low is None: initial_state_low = -1 * torch.ones((self.n,), dtype=torch.double)
+        if initial_state_high is None: initial_state_high = 1 * torch.ones((self.n,), dtype=torch.double)
+        if state_limit_low is None: state_limit_low = torch.tensor([0.5, -np.inf], dtype=torch.double)
+        if state_limit_high is None: state_limit_high = torch.tensor([2 * np.pi - 0.5, np.inf], dtype=torch.double)
+        if control_limit_low is None: control_limit_low = torch.tensor([-3.0], dtype=torch.double)
+        if control_limit_high is None: control_limit_high = torch.tensor([3.0], dtype=torch.double)
 
-        self.initial_state_low  = initial_state_low.reshape(-1)
+        self.initial_state_low = initial_state_low.reshape(-1)
         self.initial_state_high = initial_state_high.reshape(-1)
-        self.state_limit_low    = state_limit_low.reshape(-1)
-        self.state_limit_high   = state_limit_high.reshape(-1)
-        self.control_limit_low  = control_limit_low.reshape(-1)
+        self.state_limit_low = state_limit_low.reshape(-1)
+        self.state_limit_high = state_limit_high.reshape(-1)
+        self.control_limit_low = control_limit_low.reshape(-1)
         self.control_limit_high = control_limit_high.reshape(-1)
 
         # Minimal gym-ish spaces
-        self.observation_space = SimpleNamespace(shape=(self.n,))
-        self.action_space      = SimpleNamespace(shape=(self.m,))
+        # --- MODIFIED: Observation space is the AUGMENTED state ---
+        self.observation_space = SimpleNamespace(shape=(self.aug_n,))
+        # --- END MODIFIED ---
+        self.action_space = SimpleNamespace(shape=(self.m,))
 
         # init
-        self.state = None
+        self.state = None  # This will store the PHYSICAL state [theta, omega]
         self.w = None
-        self.prev_action = torch.zeros(self.m, dtype=torch.double).view(1,1,-1)
+        self.prev_action = torch.zeros(self.m, dtype=torch.double).view(1, 1, -1)
         self.control_reward_regularization = control_reward_regularization
 
         # plant + PSF model
-        self.sys  = SinglePendulum(xbar=torch.tensor(target_positions, dtype=torch.double),
-                                   x_init=x0, u_init=self.prev_action)
+        self.sys = SinglePendulum(xbar=torch.tensor(target_positions, dtype=torch.double),
+                                  x_init=x0, u_init=self.prev_action)
 
         sys_casadi = SinglePendulumCasadi(xbar=np.array(target_positions, dtype=float))
         self.PSF = MPCPredictSafetyFilter(
             sys_casadi,
             horizon=self.horizon,
-            state_lower_bound=self.state_limit_low.numpy(),   # <— flat
+            state_lower_bound=self.state_limit_low.numpy(),  # <— flat
             state_upper_bound=self.state_limit_high.numpy(),  # <— flat
             control_lower_bound=self.control_limit_low.numpy(),
             control_upper_bound=self.control_limit_high.numpy(),
@@ -168,29 +187,73 @@ class PendulumEnv:
             set_lyacon=True,
             epsilon=epsilon,
             rho=rho,
-            rho_bar = rho_bar,
-            rho_max = rho_max
+            rho_bar=rho_bar,
+            rho_max=rho_max
         )
 
     def f(self, x, u):
         # keep shape (B, 1, n)
         return self.sys.rk4_integration(x, u)
 
+    # --- MODIFIED: New helper function ---
+    def _get_augmented_state(self):
+        """
+        Constructs the augmented state \tilde{x}_t = [x_t, c_t]
+        where x_t = [theta, omega]
+        and   c_t = [phi_t, p_obs_x, p_obs_y, v_obs_x, v_obs_y]
+        """
+        # Ensure state is on the correct device
+        default_device = self.state_limit_low.device
+
+        # 1. Physical state (size 2)
+        physical_state = self.state.squeeze(0).squeeze(0).to(default_device)
+
+        # 2. Context: phi_t (size 1)
+        phi_t = torch.tensor(
+            [self.t / self.sim_horizon],
+            dtype=torch.double,
+            device=default_device
+        )
+
+        # 3. Context: obs_pos_t (size 2)
+        # get_obstacles can be slow, but is necessary
+        obs_pos_t, _ = self.obstacle.get_obstacles(self.t)
+        obs_pos_flat = obs_pos_t.reshape(-1).to(torch.double).to(default_device)
+
+        # 4. Context: obs_vel (size 2)
+        obs_vel_flat = self.obs_vel.reshape(-1).to(torch.double).to(default_device)
+
+        aug_state = torch.cat([
+            physical_state,
+            phi_t,
+            obs_pos_flat,
+            obs_vel_flat
+        ])
+        return aug_state.squeeze()  # Return shape (aug_n,)
+
+    # --- END MODIFIED ---
+
     def reset(self):
+        # Reset PHYSICAL state
         self.state = torch.rand(self.n, dtype=torch.double) * (
-                    self.initial_state_high - self.initial_state_low) + self.initial_state_low
+                self.initial_state_high - self.initial_state_low) + self.initial_state_low
         self.state = self.state.view(1, 1, -1)  # plant expects (B,1,n)
+
+        # Reset internal trackers
         self.prev_action *= 0.0
         self.t = 0
         self.min_dis = torch.tensor(float('inf'), dtype=self.state.dtype, device=self.state.device)
         self.converged_counter = 0
         self.step_reward_convergence = torch.tensor(0.0, dtype=torch.double)
-        return self.state.squeeze(0).squeeze(0)  # return (n,) to the agent
+
+        # --- MODIFIED: Return AUGMENTED state ---
+        return self._get_augmented_state()
+        # --- END MODIFIED ---
 
     def step(self, action, U_prev=None, X_prev=None):
         # PSF expects numpy 1D
         uL = np.array(action, dtype=float).reshape(-1)
-        x0 = self.state.detach().cpu().numpy().reshape(-1)
+        x0 = self.state.detach().cpu().numpy().reshape(-1)  # Use physical state
         xbar = self.target_positions.detach().cpu().numpy().reshape(-1)
 
         if self.t == 0:
@@ -206,7 +269,7 @@ class PendulumEnv:
         u = torch.tensor(U[:, 0:1].reshape(1, 1, 1), dtype=torch.double)
         action_t = u  # filtered input
 
-        # plant step
+        # plant step (updates self.state)
         self.state = self.f(self.state, action_t)
 
         # (optional) disturbance
@@ -282,9 +345,12 @@ class PendulumEnv:
 
         terminated = False
         truncated = False
-        self.t += 1
-        return self.state.squeeze(0).squeeze(0), reward, terminated, truncated, {}, U, X
 
+        # --- MODIFIED: Increment time *before* getting augmented state ---
+        self.t += 1
+        aug_state = self._get_augmented_state()
+        return aug_state, reward, terminated, truncated, {}, U, X
+        # --- END MODIFIED ---
 
     def disturbance_process(self):
         """
@@ -298,7 +364,7 @@ class PendulumEnv:
         # d[3::4] *= 0.1
         # d[2::4] *= 0.1
         # d *= torch.exp(torch.tensor(-0.05 * self.t))
-        return torch.zeros(self.n)
+        return torch.zeros(self.n)  # self.n is physical_n
 
     def render(self, mode="human"):
         """
@@ -307,7 +373,7 @@ class PendulumEnv:
         Args:
             mode (str, optional): The rendering mode. Default is "human".
         """
-        print(f"State: {self.state}")
+        print(f"State: {self.state}")  # Print physical state
 
     def close(self):
         """

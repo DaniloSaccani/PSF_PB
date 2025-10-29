@@ -9,6 +9,7 @@ sys.path.append("../")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 # Ornstein-Uhlenbeck noise process
 class OUActionNoise:
     """
@@ -53,9 +54,9 @@ class OUActionNoise:
             numpy.ndarray: The generated noise value.
         """
         x = (
-            self.x_prev
-            + self.theta * (self.mean - self.x_prev) * self.dt
-            + self.std_dev * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape)
+                self.x_prev
+                + self.theta * (self.mean - self.x_prev) * self.dt
+                + self.std_dev * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape)
         )
         self.x_prev = x
         return x
@@ -76,24 +77,30 @@ class ReplayBuffer:
     """
     A replay buffer for storing and sampling experience tuples used for training reinforcement learning agents.
 
+    --- MODIFIED ---
+    - state_buffer now stores the full *augmented* state.
+    - ..._buffer (initial_state, disturbance) stores *physical* state sequences.
+    --- END MODIFIED ---
+
     Attributes:
         buffer_capacity (int): The maximum number of samples the buffer can store, default is 100000.
         batch_size (int): The number of samples to return in each batch, default is 64.
         dynamics_input_time_window (int): The time window of dynamics input to store, default is 50.
         buffer_counter (int): Counter for the number of samples added.
-        num_states (int): The number of state features.
+        num_states (int): The number of *augmented* state features.
+        num_physical_states (int): The number of *physical* state features.
         num_dynamics_states (int): The number of dynamics state features.
         num_actions (int): The number of action features.
-        state_buffer (numpy.ndarray): Buffer storing states.
+        state_buffer (numpy.ndarray): Buffer storing augmented states.
         action_buffer (numpy.ndarray): Buffer storing actions.
         reward_buffer (numpy.ndarray): Buffer storing rewards.
-        next_state_buffer (numpy.ndarray): Buffer storing next states.
-        initial_state_buffer (numpy.ndarray): Buffer storing initial state time windows.
-        next_initial_state_buffer (numpy.ndarray): Buffer storing next initial state time windows.
+        next_state_buffer (numpy.ndarray): Buffer storing next augmented states.
+        initial_state_buffer (numpy.ndarray): Buffer storing initial physical state error time windows (for x0).
+        next_initial_state_buffer (numpy.ndarray): Buffer storing next initial physical state error time windows.
         dynamics_states_real_buffer (numpy.ndarray): Buffer storing real dynamics states.
         next_dynamics_states_real_buffer (numpy.ndarray): Buffer storing next dynamics states.
-        disturbance_buffer (numpy.ndarray): Buffer storing disturbance information.
-        next_disturbance_buffer (numpy.ndarray): Buffer storing next disturbance information.
+        disturbance_buffer (numpy.ndarray): Buffer storing physical disturbance information.
+        next_disturbance_buffer (numpy.ndarray): Buffer storing next physical disturbance information.
 
     Methods:
         record(obs_tuple): Records a new experience tuple into the buffer.
@@ -101,13 +108,14 @@ class ReplayBuffer:
     """
 
     def __init__(
-        self,
-        buffer_capacity=100000,
-        batch_size=64,
-        num_states=1,
-        num_dynamics_states=1,
-        num_actions=1,
-        dynamics_input_time_window=50,
+            self,
+            buffer_capacity=100000,
+            batch_size=64,
+            num_states=1,  # Augmented state dim (e.g., 7)
+            num_physical_states=1,  # Physical state dim (e.g., 2)
+            num_dynamics_states=1,
+            num_actions=1,
+            dynamics_input_time_window=50,
     ):
         """
         Initializes the replay buffer with the given parameters.
@@ -115,7 +123,8 @@ class ReplayBuffer:
         Args:
             buffer_capacity (int, optional): The maximum size of the buffer, default is 100000.
             batch_size (int, optional): The number of samples per batch, default is 64.
-            num_states (int, optional): Number of state features, default is 1.
+            num_states (int, optional): Number of *augmented* state features, default is 1.
+            num_physical_states (int, optional): Number of *physical* state features, default is 1.
             num_dynamics_states (int, optional): Number of dynamics state features, default is 1.
             num_actions (int, optional): Number of action features, default is 1.
             dynamics_input_time_window (int, optional): The time window for storing dynamics input, default is 50.
@@ -124,32 +133,41 @@ class ReplayBuffer:
         self.batch_size = batch_size
         self.dynamics_input_time_window = dynamics_input_time_window
         self.buffer_counter = 0
-        self.num_states = num_states
+        self.num_states = num_states  # Augmented dim
+        self.num_physical_states = num_physical_states  # Physical dim
         self.num_dynamics_states = num_dynamics_states
         self.num_actions = num_actions
 
+        # Buffers for augmented state
         self.state_buffer = np.zeros((self.buffer_capacity, self.num_states))
+        self.next_state_buffer = np.zeros((self.buffer_capacity, self.num_states))
+
+        # Buffers for action/reward
         self.action_buffer = np.zeros((self.buffer_capacity, self.num_actions))
         self.reward_buffer = np.zeros((self.buffer_capacity, 1))
-        self.next_state_buffer = np.zeros((self.buffer_capacity, self.num_states))
-        self.initial_state_buffer = np.zeros(
-            (self.buffer_capacity, self.dynamics_input_time_window, self.num_states)
-        )
-        self.next_initial_state_buffer = np.zeros(
-            (self.buffer_capacity, self.dynamics_input_time_window, self.num_states)
-        )
+
+        # Buffers for SSM internal state
         self.dynamics_states_real_buffer = np.zeros(
             (self.buffer_capacity, 1 * self.num_dynamics_states)
         )
         self.next_dynamics_states_real_buffer = np.zeros(
             (self.buffer_capacity, 1 * self.num_dynamics_states)
         )
+
+        # --- MODIFIED: Buffers for SSM *input* (physical dim) ---
+        self.initial_state_buffer = np.zeros(
+            (self.buffer_capacity, self.dynamics_input_time_window, self.num_physical_states)
+        )
+        self.next_initial_state_buffer = np.zeros(
+            (self.buffer_capacity, self.dynamics_input_time_window, self.num_physical_states)
+        )
         self.disturbance_buffer = np.zeros(
-            (self.buffer_capacity, self.dynamics_input_time_window, self.num_states)
+            (self.buffer_capacity, self.dynamics_input_time_window, self.num_physical_states)
         )
         self.next_disturbance_buffer = np.zeros(
-            (self.buffer_capacity, self.dynamics_input_time_window, self.num_states)
+            (self.buffer_capacity, self.dynamics_input_time_window, self.num_physical_states)
         )
+        # --- END MODIFIED ---
 
     def record(self, obs_tuple):
         """
@@ -162,16 +180,16 @@ class ReplayBuffer:
         """
         index = self.buffer_counter % self.buffer_capacity
 
-        self.state_buffer[index] = obs_tuple[0]
+        self.state_buffer[index] = obs_tuple[0]  # aug_state
         self.action_buffer[index] = obs_tuple[1]
         self.reward_buffer[index] = obs_tuple[2]
-        self.next_state_buffer[index] = obs_tuple[3]
-        self.initial_state_buffer[index] = obs_tuple[4]
-        self.next_initial_state_buffer[index] = obs_tuple[5]
+        self.next_state_buffer[index] = obs_tuple[3]  # next_aug_state
+        self.initial_state_buffer[index] = obs_tuple[4]  # x0 sequence (physical)
+        self.next_initial_state_buffer[index] = obs_tuple[5]  # next x0 sequence (physical)
         self.dynamics_states_real_buffer[index] = obs_tuple[6]
         self.next_dynamics_states_real_buffer[index] = obs_tuple[7]
-        self.disturbance_buffer[index] = obs_tuple[8]
-        self.next_disturbance_buffer[index] = obs_tuple[9]
+        self.disturbance_buffer[index] = obs_tuple[8]  # w sequence (physical)
+        self.next_disturbance_buffer[index] = obs_tuple[9]  # next w sequence (physical)
 
         self.buffer_counter += 1
 
@@ -235,11 +253,17 @@ class Actor(nn.Module):
     """
     The Actor network that takes the state and predicts the control action.
 
+    --- MODIFIED ---
+    - `num_states` is the *augmented* state dim (e.g., 7) for the direction_mlp.
+    - `num_physical_states` is the *physical* state dim (e.g., 2) for the m_dynamics (SSM) input.
+    - `forward` now correctly uses `dynamics_input_time_window` for the SSM.
+    --- END MODIFIED ---
+
     Attributes:
         control_action_upper_bound (float): The upper bound for the control action.
         direction_mlp (torch.nn.Sequential): MLP used to predict the direction term of the action.
         m_dynamics (SSM): A state-space model used to handle dynamics.
-        num_states (int): Number of input states.
+        num_states (int): Number of input augmented states.
         m_term (torch.Tensor or None): The model term of the action.
         a_term (torch.Tensor or None): The action term.
         d_term (torch.Tensor or None): The disturbance term.
@@ -251,19 +275,21 @@ class Actor(nn.Module):
     """
 
     def __init__(
-        self,
-        num_states,
-        num_actions,
-        control_action_upper_bound,
-        num_dynamics_states=3,
-        hidden_dim=10,
-        nn_type='mad'
+            self,
+            num_states,  # Augmented state dim
+            num_physical_states,  # Physical state dim
+            num_actions,
+            control_action_upper_bound,
+            num_dynamics_states=3,
+            hidden_dim=10,
+            nn_type='mad'
     ):
         """
         Initializes the Actor network.
 
         Args:
-            num_states (int): Number of input states.
+            num_states (int): Number of input *augmented* states (for direction).
+            num_physical_states (int): Number of input *physical* states (for magnitude).
             num_actions (int): Number of output actions.
             control_action_upper_bound (float): The upper bound for the control action.
             num_dynamics_states (int, optional): Number of dynamics states, default is 2.
@@ -274,6 +300,7 @@ class Actor(nn.Module):
         self.nn_type = nn_type
         self.dir_gain = nn.Parameter(torch.ones(1, num_actions))
 
+        # --- MODIFIED: input is augmented state ---
         self.direction_mlp = nn.Sequential(
             nn.Linear(num_states, hidden_dim, bias=False),
             nn.Tanh(),
@@ -281,12 +308,13 @@ class Actor(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, num_actions, bias=False),
         )
+        # --- END MODIFIED ---
 
         # LSTM for sequential processing of state
         if nn_type == 'lstm':
             lstm_hidden_dim = 48
             self.lstm = nn.LSTM(
-                input_size=num_states,
+                input_size=num_states,  # Augmented state
                 hidden_size=lstm_hidden_dim,
                 num_layers=1,
                 batch_first=True,
@@ -296,12 +324,14 @@ class Actor(nn.Module):
 
         self._initialize_weights()
 
+        # --- MODIFIED: input is physical state ---
         self.m_dynamics = SSM(
-            in_features=num_states,
+            in_features=num_physical_states,  # Input is x0 sequence
             out_features=num_actions,
             state_features=num_dynamics_states,
             scan=True,
         )
+        # --- END MODIFIED ---
 
         self.num_states = num_states
         self.m_term = None
@@ -333,26 +363,34 @@ class Actor(nn.Module):
                     param.data[hidden:2 * hidden] = 1.0
 
     def forward(
-        self, state, dynamics_input_time_window, dynamics_disturbance_time_window
+            self, state, dynamics_input_time_window, dynamics_disturbance_time_window
     ):
         """
         Forward pass to compute the action based on the state and dynamics input.
 
+        --- MODIFIED ---
+        - `state` is the *augmented* state \tilde{x}_t.
+        - The SSM (`m_dynamics`) is fed `dynamics_input_time_window` (the x0 sequence)
+          instead of `dynamics_disturbance_time_window`.
+        --- END MODIFIED ---
+
         Args:
-            state (torch.Tensor): The current state.
-            dynamics_input_time_window (torch.Tensor): The initial state time window.
-            dynamics_disturbance_time_window (torch.Tensor): The disturbance time window.
+            state (torch.Tensor): The current *augmented* state.
+            dynamics_input_time_window (torch.Tensor): The initial state time window (x0 sequence).
+            dynamics_disturbance_time_window (torch.Tensor): The disturbance time window (w sequence).
 
         Returns:
             torch.Tensor: The computed action.
         """
         if self.nn_type == 'mad':
+            # Direction term uses the full augmented state
             direction_term = self.direction_mlp(state)
 
+            # --- MODIFIED: Magnitude term (SSM) uses the x0 sequence ---
             if dynamics_input_time_window.dim() == 2:
-                dynamics_disturbance = dynamics_disturbance_time_window.unsqueeze(0)
-                dynamics_disturbance_output = self.m_dynamics(dynamics_disturbance)
-                m_term = dynamics_disturbance_output.squeeze(0)[-1, :]
+                dynamics_input = dynamics_input_time_window.unsqueeze(0)
+                dynamics_input_output = self.m_dynamics(dynamics_input)
+                m_term = dynamics_input_output.squeeze(0)[-1, :]
                 d_term = torch.tanh(direction_term) * self.control_action_upper_bound
                 d_term = self.dir_gain * d_term  # <-- NEW: scale direction by learnable gain
                 action = (m_term) * d_term
@@ -360,13 +398,14 @@ class Actor(nn.Module):
                     action = action.unsqueeze(0)
 
             elif dynamics_input_time_window.dim() == 3:
-                dynamics_disturbance = dynamics_disturbance_time_window
-                dynamics_disturbance_output = self.m_dynamics(dynamics_disturbance)
-                m_term = dynamics_disturbance_output[:, -1, :]
+                dynamics_input = dynamics_input_time_window
+                dynamics_input_output = self.m_dynamics(dynamics_input)
+                m_term = dynamics_input_output[:, -1, :]
                 d_term = torch.tanh(direction_term) * self.control_action_upper_bound
                 action = (m_term) * d_term
                 if action.dim() == 1:
                     action = action.unsqueeze(0)
+            # --- END MODIFIED ---
 
             return action
 
@@ -383,10 +422,15 @@ class Actor(nn.Module):
         else:
             print(f'Unknown nn_type {self.nn_type}')
 
+
 # Critic network
 class Critic(nn.Module):
     """
     The Critic network used to estimate the value function.
+
+    --- MODIFIED ---
+    - `num_states` is the *augmented* state dim (e.g., 7).
+    --- END MODIFIED ---
 
     Attributes:
         fc1 (torch.nn.Linear): First fully connected layer.
@@ -405,12 +449,14 @@ class Critic(nn.Module):
         Initializes the Critic network.
 
         Args:
-            num_states (int): Number of input states.
+            num_states (int): Number of input *augmented* states.
             num_dynamics_states (int): Number of dynamics states.
             num_actions (int): Number of actions.
         """
         super(Critic, self).__init__()
+        # --- MODIFIED: Input layer uses augmented state size ---
         self.fc1 = nn.Linear(num_states + 1 * num_dynamics_states, 16)
+        # --- END MODIFIED ---
         self.fc2 = nn.Linear(16, 32)
         self.fc3 = nn.Linear(num_actions, 32)
         self.fc4 = nn.Linear(32 * 2, 256)
@@ -422,7 +468,7 @@ class Critic(nn.Module):
         Forward pass to compute the value estimate.
 
         Args:
-            state (torch.Tensor): The state tensor.
+            state (torch.Tensor): The *augmented* state tensor.
             dynamics_states_real (torch.Tensor): The real dynamics states tensor.
             action (torch.Tensor): The action tensor.
 
@@ -443,136 +489,114 @@ class Critic(nn.Module):
 # DDPG agent class
 class MADController:
     """
-    MADController class for implementing a Magnitude And Direction Policy Parametrization based control agent using Deep Deterministic Policy Gradient (DDPG) algorithm.
+    MADController class...
 
-    This class manages the agent's interaction with an environment, its policy, and learning process. It includes functionality for managing dynamics input and disturbance windows, actor and critic models, and updating target networks. The agent operates in continuous action spaces and is trained using DDPG with experience replay and Ornstein-Uhlenbeck noise for exploration.
+    --- MODIFIED ---
+    - Renamed `self.aug_state` to `self.state` (it holds the augmented state).
+    - Added `self.num_physical_states`.
+    - Corrected `__init__` to slice `self.state` for physical state error calculation.
+    - Corrected `get_trajectory` to manually build the initial augmented state.
+    - Corrected `set_ep_initial_state` call
+    - **Corrected `if` condition in `train` loop**
+    --- END MODIFIED ---
 
     Attributes:
         env (gym.Env): The environment with which the agent interacts.
-        num_states (int): The number of states in the environment.
+        num_states (int): The number of *augmented* states in the environment.
+        num_physical_states (int): The number of *physical* states in the environment.
         num_actions (int): The number of actions in the environment.
-        state (torch.Tensor): Current state of the agent.
-        target_state (torch.Tensor): Target state the agent is aiming for.
-        state_error (torch.Tensor): Difference between current state and target state.
-        w (torch.Tensor): State-related dynamics information.
-        num_dynamics_states (int): The number of dynamics states.
-        dynamics_states_real (torch.Tensor): Real-time dynamics states.
-        dynamics_input_time_window (torch.Tensor): The window of recent dynamics inputs.
-        dynamics_disturbance_time_window (torch.Tensor): The window of recent dynamics disturbances.
-        ep_initial_state (torch.Tensor): Initial state for the episode.
-        ep_timestep (torch.Tensor): Current timestep in the episode.
-        actor_model (Actor): The actor network, responsible for selecting actions.
-        target_actor (Actor): The target actor network, used for stable updates.
-        critic_model (Critic): The critic network, evaluates actions taken by the actor.
-        target_critic (Critic): The target critic network, used for stable updates.
-        critic_optimizer (torch.optim.Optimizer): Optimizer for the critic network.
-        actor_optimizer (torch.optim.Optimizer): Optimizer for the actor network.
-        ou_noise (OUActionNoise): Ornstein-Uhlenbeck noise for exploration.
-        buffer (ReplayBuffer): Experience replay buffer for training.
-        gamma (float): Discount factor for future rewards.
-        tau (float): Soft update parameter for target networks.
-        control_action_upper_bound (float): Upper bound for the action values.
-        control_action_lower_bound (float): Lower bound for the action values.
-        episode_count (int): Counter for the number of episodes.
-        rewards_list (list): List of rewards accumulated during training.
-        rewards_ma50_list (list): List of 50-episode moving average rewards.
-
-    Methods:
-        __init__: Initializes the MADController with the provided parameters.
-        set_ep_initial_state: Sets the initial state for the episode relative to the target state.
-        update_dynamics_input_time_window: Updates the dynamics input time window with the current state.
-        reset_ep_timestep: Resets the episode timestep and clears the disturbance window.
-        update_ep_timestep: Increments the episode timestep and updates the state error.
-        policy: Selects an action based on the current state and dynamics information.
-        learned_policy: Selects an action using the learned policy (actor model).
-        update_target: Soft updates the target actor and target critic networks.
-        train: Trains the agent over multiple episodes using the DDPG algorithm.
-        get_trajectory: Generates a trajectory by interacting with the environment from a given initial state.
-        get_trajectory_with_loss_terms: Generates a trajectory and collects loss terms for various components.
-        save_model_weights: Saves the weights of the actor, critic, and optimizers to a file.
-        load_model_weight: Loads the weights of the actor, critic, and optimizers from a file.
+        state (torch.Tensor): Current *augmented* state of the agent.
+        target_state (torch.Tensor): Target *physical* state the agent is aiming for.
+        state_error (torch.Tensor): Difference between current *physical* state and target state.
+        w (torch.Tensor): *Physical* state-related dynamics information (disturbance).
+        ...
+        ep_initial_aug_state (torch.Tensor): Initial *augmented* state for the episode.
+        ep_initial_state_error (torch.Tensor): Initial *physical* state error for the episode.
+        ...
     """
 
     def __init__(
-        self,
-        env,
-        buffer_capacity=100000,
-        target_state=None,
-        num_dynamics_states=8,
-        dynamics_input_time_window_length=500,
-        batch_size=64,
-        gamma=0.99,
-        tau=0.005,
-        actor_lr=0.0005, # changed from 0.001 to 0.0005
-        critic_lr=0.002,
-        std_dev=0.2,
-        control_action_upper_bound=1,
-        control_action_lower_bound=-1,
-        nn_type='mad'
+            self,
+            env,
+            buffer_capacity=100000,
+            target_state=None,
+            num_dynamics_states=8,
+            dynamics_input_time_window_length=500,
+            batch_size=64,
+            gamma=0.99,
+            tau=0.005,
+            actor_lr=0.0005,  # changed from 0.001 to 0.0005
+            critic_lr=0.002,
+            std_dev=0.2,
+            control_action_upper_bound=1,
+            control_action_lower_bound=-1,
+            nn_type='mad'
     ):
         """
         Initializes the MADController agent for training in a given environment.
-
-        Args:
-            env: The environment to interact with (should support OpenAI Gym interface).
-            buffer_capacity (int, optional): The capacity of the replay buffer. Defaults to 100000.
-            target_state (array-like, optional): The target state for the agent. Defaults to None.
-            num_dynamics_states (int, optional): The number of dynamics states for the agent. Defaults to 2.
-            dynamics_input_time_window_length (int, optional): The length of the dynamics input time window. Defaults to 500.
-            batch_size (int, optional): The batch size for training. Defaults to 64.
-            gamma (float, optional): The discount factor for future rewards. Defaults to 0.99.
-            tau (float, optional): The soft update factor for target networks. Defaults to 0.005.
-            actor_lr (float, optional): The learning rate for the actor model. Defaults to 0.001.
-            critic_lr (float, optional): The learning rate for the critic model. Defaults to 0.002.
-            std_dev (float, optional): The standard deviation for noise in action selection. Defaults to 0.2.
-            control_action_upper_bound (float, optional): The upper bound for control actions. Defaults to 1.
-            control_action_lower_bound (float, optional): The lower bound for control actions. Defaults to -1.
         """
 
         self.env = env
-        self.num_states = env.observation_space.shape[0]
+        # --- MODIFIED: Distinguish physical and augmented state dims ---
+        self.num_states = env.observation_space.shape[0]  # Augmented state dim
+        self.num_physical_states = env.sys.state_dim  # Physical state dim
         self.num_actions = env.action_space.shape[0]
 
-        self.state = torch.zeros(self.num_states).to(device)
+        self.state = torch.zeros(self.num_states).to(device)  # Current augmented state
         if target_state is None:
-            self.target_state = torch.zeros(self.num_states).to(device)
+            self.target_state = torch.zeros(self.num_physical_states).to(device)
         else:
-            self.target_state = target_state.to(device)
-        self.state_error = self.state - self.target_state
-        self.w = torch.zeros(self.num_states).to(device)
+            self.target_state = target_state.to(device)  # Target is physical
+
+        # --- THIS IS THE FIX for your traceback ---
+        # State error is physical, computed from slicing the augmented state
+        self.state_error = self.state[:self.num_physical_states] - self.target_state
+        self.w = torch.zeros(self.num_physical_states).to(device)  # Disturbance is physical
+        # --- END MODIFIED ---
 
         self.num_dynamics_states = num_dynamics_states
         self.dynamics_states_real = torch.zeros(1 * self.num_dynamics_states).to(device)
         self.dynamics_input_time_window_length = dynamics_input_time_window_length
+
+        # --- MODIFIED: SSM inputs are physical dim ---
         self.dynamics_input_time_window = torch.zeros(
-            (self.dynamics_input_time_window_length, self.num_states)
+            (self.dynamics_input_time_window_length, self.num_physical_states)
         ).to(device)
         self.dynamics_disturbance_time_window = torch.zeros(
-            (self.dynamics_input_time_window_length, self.num_states)
+            (self.dynamics_input_time_window_length, self.num_physical_states)
         ).to(device)
-        self.ep_initial_state = torch.zeros(self.num_states).to(device)
+        self.ep_initial_aug_state = torch.zeros(self.num_states).to(device)
+        self.ep_initial_state_error = torch.zeros(self.num_physical_states).to(device)  # Physical
+        # --- END MODIFIED ---
         self.ep_timestep = torch.ones(1).to(device)
 
+        # --- MODIFIED: Pass correct dims to Actor ---
         self.actor_model = Actor(
-            self.num_states,
-            self.num_actions,
-            control_action_upper_bound,
-            self.num_dynamics_states,
+            num_states=self.num_states,
+            num_physical_states=self.num_physical_states,
+            num_actions=self.num_actions,
+            control_action_upper_bound=control_action_upper_bound,
+            num_dynamics_states=self.num_dynamics_states,
             nn_type=nn_type
         ).to(device)
         self.target_actor = Actor(
-            self.num_states,
-            self.num_actions,
-            control_action_upper_bound,
-            self.num_dynamics_states,
+            num_states=self.num_states,
+            num_physical_states=self.num_physical_states,
+            num_actions=self.num_actions,
+            control_action_upper_bound=control_action_upper_bound,
+            num_dynamics_states=self.num_dynamics_states,
             nn_type=nn_type
         ).to(device)
+        # --- END MODIFIED ---
+
+        # --- MODIFIED: Pass correct dims to Critic ---
         self.critic_model = Critic(
             self.num_states, self.num_dynamics_states, self.num_actions
         ).to(device)
         self.target_critic = Critic(
             self.num_states, self.num_dynamics_states, self.num_actions
         ).to(device)
+        # --- END MODIFIED ---
 
         self.target_actor.load_state_dict(self.actor_model.state_dict())
         self.target_critic.load_state_dict(self.critic_model.state_dict())
@@ -586,14 +610,18 @@ class MADController:
             mean=np.zeros(self.num_actions),
             std_deviation=float(std_dev) * np.ones(self.num_actions),
         )
+
+        # --- MODIFIED: Pass correct dims to ReplayBuffer ---
         self.buffer = ReplayBuffer(
             buffer_capacity=buffer_capacity,
             batch_size=batch_size,
             num_states=self.num_states,
+            num_physical_states=self.num_physical_states,
             num_dynamics_states=self.num_dynamics_states,
             num_actions=self.num_actions,
             dynamics_input_time_window=self.dynamics_input_time_window_length,
         )
+        # --- END MODIFIED ---
 
         self.gamma = gamma
         self.tau = tau
@@ -614,37 +642,53 @@ class MADController:
 
         self.actor_loss_list = []
         self.critic_loss_list = []
-    def set_ep_initial_state(self, initial_state):
+
+    def set_ep_initial_state(self, initial_aug_state):
         """
         Sets the initial state of the episode relative to the target state.
 
+        --- MODIFIED ---
+        - Takes `initial_aug_state` (size 7).
+        - Computes and stores `ep_initial_state_error` (size 2).
+        --- END MODIFIED ---
+
         Args:
-            initial_state (array-like): The initial state for the episode.
+            initial_aug_state (array-like): The initial *augmented* state for the episode.
         """
-        self.ep_initial_state = initial_state.to(
+        self.ep_initial_aug_state = initial_aug_state.to(
             device
         )
-        self.ep_initial_state = self.ep_initial_state - self.target_state
+        # Error is based on physical part of the state
+        ep_initial_physical_state = initial_aug_state[:self.num_physical_states]
+        self.ep_initial_state_error = ep_initial_physical_state - self.target_state
 
     def update_dynamics_input_time_window(self):
         """
         Updates the dynamics input time window with the current state.
+
+        --- MODIFIED ---
+        - `dynamics_input_time_window` (for x0) is populated with *physical* state error.
+        - `dynamics_disturbance_time_window` (for w) is populated with *physical* disturbance.
+        --- END MODIFIED ---
         """
         self.dynamics_input_time_window *= 0.0
         update_index = int(
             self.dynamics_input_time_window_length - self.ep_timestep.cpu().item()
         )
         if update_index >= 0:
-            self.dynamics_input_time_window[update_index] = self.ep_initial_state
+            # x0 sequence is the initial *physical* state error
+            self.dynamics_input_time_window[update_index] = self.ep_initial_state_error
+
         if self.ep_timestep == 1:
-            self.dynamics_disturbance_time_window[-1] = self.ep_initial_state
+            # Disturbance sequence
+            self.dynamics_disturbance_time_window[-1] = self.ep_initial_state_error
         if self.ep_timestep >= self.dynamics_input_time_window_length:
             self.dynamics_disturbance_time_window = (
                 self.dynamics_disturbance_time_window
             )
         else:
             temp = torch.roll(self.dynamics_disturbance_time_window, shifts=-1, dims=0)
-            temp[-1] = self.w
+            temp[-1] = self.w  # self.w is physical (size 2)
             self.dynamics_disturbance_time_window = temp
 
     def reset_ep_timestep(self):
@@ -652,7 +696,8 @@ class MADController:
         Resets the episode timestep and clears the dynamics disturbance time window.
         """
         self.ep_timestep = torch.ones(1).to(device)
-        self.state_error = self.state - self.target_state
+        # State error is physical
+        self.state_error = self.state[:self.num_physical_states] - self.target_state
         self.dynamics_disturbance_time_window *= 0.0
 
     def update_ep_timestep(self):
@@ -660,23 +705,28 @@ class MADController:
         Increments the episode timestep and updates the state error.
         """
         self.ep_timestep += 1
-        self.state_error = self.state - self.target_state
+        # State error is physical
+        self.state_error = self.state[:self.num_physical_states] - self.target_state
 
     def policy(
-        self, state, dynamics_input_time_window, dynamics_disturbance_time_window
+            self, state, dynamics_input_time_window, dynamics_disturbance_time_window
     ):
         """
         Selects an action based on the current state and dynamics information, adding noise for exploration.
 
+        --- MODIFIED ---
+        - `state` argument is the *augmented* state.
+        --- END MODIFIED ---
+
         Args:
-            state (array-like): The current state of the agent.
-            dynamics_input_time_window (array-like): The current dynamics input time window.
-            dynamics_disturbance_time_window (array-like): The current dynamics disturbance time window.
+            state (array-like): The current *augmented* state of the agent.
+            dynamics_input_time_window (array-like): The current dynamics input time window (x0).
+            dynamics_disturbance_time_window (array-like): The current dynamics disturbance time window (w).
 
         Returns:
             np.ndarray: The selected action within the valid control bounds.
         """
-        state = state.to(device)
+        state = state.to(device)  # state is augmented
         sampled_actions = (
             self.actor_model(
                 state, dynamics_input_time_window, dynamics_disturbance_time_window
@@ -693,24 +743,27 @@ class MADController:
         return sampled_actions
 
     def learned_policy(
-        self, state, dynamics_input_time_window, dynamics_disturbance_time_window
+            self, state, dynamics_input_time_window, dynamics_disturbance_time_window
     ):
         """
         Selects an action using the learned policy (actor model).
 
+        --- MODIFIED ---
+        - `state` argument is the *augmented* state.
+        --- END MODIFIED ---
+
         Args:
-            state (array-like): The current state of the agent.
-            dynamics_input_time_window (array-like): The current dynamics input time window.
-            dynamics_disturbance_time_window (array-like): The current dynamics disturbance time window.
+            state (array-like): The current *augmented* state of the agent.
+            dynamics_input_time_window (array-like): The current dynamics input time window (x0).
+            dynamics_disturbance_time_window (array-like): The current dynamics disturbance time window (w).
 
         Returns:
             np.ndarray: The selected action within the valid control bounds.
         """
-        state = state.to(device)
+        state = state.to(device)  # state is augmented
         sampled_actions = self.actor_model(
-                state, dynamics_input_time_window, dynamics_disturbance_time_window
-            )
-
+            state, dynamics_input_time_window, dynamics_disturbance_time_window
+        )
 
         return sampled_actions.cpu().detach().numpy()
 
@@ -719,14 +772,14 @@ class MADController:
         Soft updates the target actor and target critic networks based on the current actor and critic networks using the tau parameter.
         """
         for target_param, param in zip(
-            self.target_actor.parameters(), self.actor_model.parameters()
+                self.target_actor.parameters(), self.actor_model.parameters()
         ):
             target_param.data.copy_(
                 self.tau * param.data + (1 - self.tau) * target_param.data
             )
 
         for target_param, param in zip(
-            self.target_critic.parameters(), self.critic_model.parameters()
+                self.target_critic.parameters(), self.critic_model.parameters()
         ):
             target_param.data.copy_(
                 self.tau * param.data + (1 - self.tau) * target_param.data
@@ -736,24 +789,31 @@ class MADController:
         """
         Trains the agent over multiple episodes using the DDPG algorithm.
 
-        Args:
-            total_episodes (int, optional): The total number of episodes to train the agent. Defaults to 100.
-            episode_length (int, optional): The maximum length of each episode. Defaults to 100.
-            verbose (bool, optional): If True, prints episode details during training. Defaults to True.
+        --- MODIFIED ---
+        - Uses `self.state` to store the augmented observation from the env.
+        - Passes `self.state` to the policy.
+        - Records `state` and `next_state` (augmented) in the buffer.
+        - Corrected call to `set_ep_initial_state`
+        - **Corrected `if` condition in `train` loop**
+        --- END MODIFIED ---
         """
-
 
         for ep in range(total_episodes):
             self.episode_count += 1
             self.ou_noise.reset()
-            self.state = self.env.reset().to(device)
-            self.last_episode_ic = self.env.state.squeeze(0).squeeze(0).detach().cpu().clone()
+            # --- MODIFIED: Reset returns augmented state ---
+            self.state = self.env.reset().to(device)  # self.state now holds aug_state
+            self.last_episode_ic = self.env.state.squeeze(0).squeeze(0).detach().cpu().clone()  # Store physical IC
+            # --- END MODIFIED ---
+
             self.dynamics_states_real = torch.cat(
                 [
                     self.actor_model.m_dynamics.LRUR.states_last.real.squeeze(),
                 ]
             )
-            self.set_ep_initial_state(initial_state=self.state)
+            # --- THIS IS THE FIX ---
+            self.set_ep_initial_state(initial_aug_state=self.state)  # Pass aug_state
+            # --- END MODIFIED ---
             self.reset_ep_timestep()
             self.update_dynamics_input_time_window()
             episodic_reward = 0
@@ -761,46 +821,54 @@ class MADController:
             episodic_control_reward = 0
             episodic_obs_reward = 0
 
-
             while True:
+                # --- MODIFIED: Policy takes augmented state ---
                 action = self.policy(
-                    state=self.state_error,
+                    state=self.state,
                     dynamics_input_time_window=self.dynamics_input_time_window,
                     dynamics_disturbance_time_window=self.dynamics_disturbance_time_window,
                 )
-                old_state_error = self.state_error.clone()
+                old_state = self.state.clone()  # old_aug_state
+                # --- END MODIFIED ---
+
                 old_dynamics_states_real = self.dynamics_states_real.clone()
                 old_dynamics_input_time_window = self.dynamics_input_time_window.clone()
                 old_dynamics_disturbance_time_window = (
                     self.dynamics_disturbance_time_window.clone()
                 )
-                if self.env.t == 0:
+
+                # --- THIS IS THE FIX for your traceback ---
+                if self.env.t == 0:  # Check *before* step. t is 0 on first step.
                     next_state, reward, done, truncated, _, U_prev, X_prev = self.env.step(action)
                 else:
                     next_state, reward, done, truncated, _, U_prev, X_prev = self.env.step(action, U_prev, X_prev)
+                # --- END MODIFIED ---
 
-                self.state = next_state.to(device)
-                self.w = self.env.w
+                self.state = next_state.to(device)  # self.state now holds next_aug_state
+                self.w = self.env.w  # w is physical
+
                 self.dynamics_states_real = torch.cat(
                     [
                         self.actor_model.m_dynamics.LRUR.states_last.real.squeeze(),
                     ]
                 )
-                self.update_ep_timestep()
-                self.update_dynamics_input_time_window()
+                self.update_ep_timestep()  # Computes physical state_error
+                self.update_dynamics_input_time_window()  # Uses physical error/w
 
+                # --- MODIFIED: Record augmented states ---
                 obs_tuple = (
-                    old_state_error.cpu(),
+                    old_state.cpu(),
                     action,
                     reward,
-                    self.state_error.cpu(),
-                    old_dynamics_input_time_window.cpu(),
-                    self.dynamics_input_time_window.cpu(),
+                    self.state.cpu(),  # next_aug_state
+                    old_dynamics_input_time_window.cpu(),  # physical
+                    self.dynamics_input_time_window.cpu(),  # physical
                     old_dynamics_states_real.cpu().detach(),
                     self.dynamics_states_real.cpu().detach(),
-                    old_dynamics_disturbance_time_window.cpu(),
-                    self.dynamics_disturbance_time_window.cpu(),
+                    old_dynamics_disturbance_time_window.cpu(),  # physical
+                    self.dynamics_disturbance_time_window.cpu(),  # physical
                 )
+                # --- END MODIFIED ---
 
                 self.buffer.record(obs_tuple=obs_tuple)
                 episodic_reward += reward
@@ -822,6 +890,7 @@ class MADController:
                         next_dynamics_disturbance_time_window_batch,
                     ) = self.buffer.sample()
 
+                    # state_batch and next_state_batch are augmented states
                     with torch.no_grad():
                         target_actions = self.target_actor(
                             state=next_state_batch,
@@ -870,10 +939,9 @@ class MADController:
             self.rewards_state_list.append(episodic_state_reward)
             self.rewards_control_diff_list.append(episodic_control_reward)
             self.rewards_obs_list.append(episodic_obs_reward)
-            self.rewards_state_normalized_list.append(episodic_state_reward/self.env.alpha_state)
-            self.rewards_control_normalized_list.append(episodic_control_reward/self.env.alpha_control)
-            self.rewards_obs_normalized_list.append(episodic_obs_reward/self.env.alpha_obst)
-
+            self.rewards_state_normalized_list.append(episodic_state_reward / self.env.alpha_state)
+            self.rewards_control_normalized_list.append(episodic_control_reward / self.env.alpha_control)
+            self.rewards_obs_normalized_list.append(episodic_obs_reward / self.env.alpha_obst)
 
             ma50_rerward = np.mean(self.rewards_list[-50:])
             self.rewards_ma50_list.append(ma50_rerward)
@@ -891,53 +959,87 @@ class MADController:
         """
         Generates a trajectory by interacting with the environment from a given initial state.
 
+        --- MODIFIED ---
+        - `initial_state` is the *physical* state (size 2).
+        - Manually resets env and calls `_get_augmented_state` to get the first `self.state`.
+        - Passes `self.state` (augmented) to the `learned_policy`.
+        - `obs_list` correctly tracks the *physical* state for plotting.
+        - Corrected call to `set_ep_initial_state`
+        --- END MODIFIED ---
+
         Args:
-            initial_state (array-like): The starting state of the trajectory.
+            initial_state (array-like): The starting *physical* state of the trajectory (size 2).
             timesteps (int, optional): The number of timesteps to simulate. Defaults to 300.
 
         Returns:
             tuple: A tuple containing:
                 - rewards_list: List of rewards received during the trajectory.
-                - obs_list: List of observed states during the trajectory.
+                - obs_list: List of observed *physical* states during the trajectory.
                 - action_list: List of actions taken during the trajectory.
                 - w_list: List of environment states (or any relevant data for the trajectory).
         """
 
-        _ = self.env.reset()
-        self.env.state = initial_state.view(1, 1, -1)  # keep (B,1,n)
-        self.state = initial_state.to(device)  # controller's copy
-        self.set_ep_initial_state(initial_state=initial_state)
+        # --- MODIFIED: Manual reset using physical state ---
+        _ = self.env.reset()  # Reset to get valid obstacle info
+        # Set physical state in env
+        self.env.state = initial_state.view(1, 1, -1).to(self.env.state_limit_low.device)
+        self.env.t = 0
+        self.env.min_dis = torch.tensor(float('inf'), dtype=self.env.state.dtype, device=self.env.state.device)
+        self.env.converged_counter = 0
+
+        # Get the initial augmented state from the env
+        aug_state = self.env._get_augmented_state().to(device)
+        self.state = aug_state  # Set controller's state (self.state is augmented)
+
+        # --- THIS IS THE FIX ---
+        self.set_ep_initial_state(initial_aug_state=self.state)  # Pass augmented state
+        # --- END MODIFIED ---
         self.reset_ep_timestep()
         self.update_dynamics_input_time_window()
+
+        # obs_list tracks PHYSICAL state for plotting
         obs_list = [self.env.state.squeeze(0).squeeze(0).detach().cpu()]
+        # --- END MODIFIED ---
+
         w_list = []
         rewards_list = []
         u_L_log = []
         u_log = []
         for _ in range(timesteps):
-            state_error = (
-                self.env.state.to(device) - self.target_state
-            ).to(device)
-            action= self.learned_policy(
-                state_error,
+            # --- MODIFIED: Policy takes augmented state ---
+            action = self.learned_policy(
+                self.state,  # self.state is augmented
                 self.dynamics_input_time_window,
                 self.dynamics_disturbance_time_window,
             )
+            # --- END MODIFIED ---
+
             if self.env.t == 0:
                 obs, reward, done, truncated, info, U_prev, X_prev = self.env.step(action)
             else:
                 obs, reward, done, truncated, info, U_prev, X_prev = self.env.step(action, U_prev, X_prev)
 
+            # obs is the next_aug_state
             self.w = self.env.w
-            obs_list.append(obs)
+
+            # --- MODIFIED: Store physical state for plotting ---
+            obs_list.append(self.env.state.squeeze(0).squeeze(0).detach().cpu())
+            # --- END MODIFIED ---
+
             w_list.append(self.env.w)
             u_L_log.append(action)
-            u_log.append(U_prev[:,0])
-
+            u_log.append(U_prev[:, 0])
 
             rewards_list.append(reward)
+
+            # --- MODIFIED: Update controller's augmented state ---
+            self.state = obs.to(device)  # self.state is augmented
+            # --- END MODIFIED ---
+
             self.update_ep_timestep()
             self.update_dynamics_input_time_window()
+
+        # obs_arr is (1, T+1, physical_n)
         obs_arr = np.stack([
             (o.detach().cpu().numpy() if torch.is_tensor(o) else np.asarray(o)).reshape(-1)
             for o in obs_list
@@ -952,14 +1054,14 @@ class MADController:
         # u_log: you stored U_prev[:,0] (numpy 1D); stack to (T, m) then add batch
         u_arr = np.stack(u_log, axis=0)[None, ...]  # shape (1, T, m)
 
-        # w_list: list of tensors (n,) -> stack to (T, n)
+        # w_list: list of tensors (physical_n,) -> stack to (T, physical_n)
         w_arr = np.stack([
             (w.detach().cpu().numpy() if torch.is_tensor(w) else np.asarray(w)).reshape(-1)
             for w in w_list
         ], axis=0)  # shape (T, n)
 
         return rewards_list, obs_arr, uL_arr, w_arr, u_arr
-        #return rewards_list, np.array(obs_list).transpose(1, 0, 2), np.expand_dims(u_L_log, axis=0), w_list, np.expand_dims(u_log, axis=0)
+        # return rewards_list, np.array(obs_list).transpose(1, 0, 2), np.expand_dims(u_L_log, axis=0), w_list, np.expand_dims(u_log, axis=0)
 
     def save_model_weights(self, filename):
         """
@@ -990,7 +1092,11 @@ class MADController:
 
         # 0: actor, 1: critic, 2: target_actor, 3: target_critic,
         # 4: actor_opt, 5: critic_opt, 6: actor.m_dynamics, 7: target_actor.m_dynamics
-        self.actor_model.load_state_dict(ckpt[0], strict=False)  # <-- strict=False
+
+        # --- MODIFIED: Use strict=False to handle potential shape mismatches ---
+        # This will *fail* if you try to load an *old* checkpoint with the *new*
+        # architecture, which is expected.
+        self.actor_model.load_state_dict(ckpt[0], strict=False)
         self.critic_model.load_state_dict(ckpt[1], strict=False)
         self.target_actor.load_state_dict(ckpt[2], strict=False)
         self.target_critic.load_state_dict(ckpt[3], strict=False)
@@ -1000,6 +1106,7 @@ class MADController:
             self.actor_model.m_dynamics.load_state_dict(ckpt[6], strict=False)
         if len(ckpt) > 7:
             self.target_actor.m_dynamics.load_state_dict(ckpt[7], strict=False)
+        # --- END MODIFIED ---
 
         # Optimizers: best-effort load; if it fails (old runs), re-init silently
         try:
@@ -1144,14 +1251,14 @@ class LRU(
     # the paper " Resurrecting Linear Recurrences ".
     # The LRU is simulated using Parallel Scan (fast!) when "scan" is set to True (default), otherwise recursively (slow).
     def __init__(
-        self,
-        in_features,
-        out_features,
-        state_features,
-        scan=True,
-        rmin=0.96,
-        rmax=0.976,
-        max_phase=0.0#6.283,
+            self,
+            in_features,
+            out_features,
+            state_features,
+            scan=True,
+            rmin=0.96,
+            rmax=0.976,
+            max_phase=0.0  # 6.283,
     ):
         super().__init__()
         self.state_features = state_features
@@ -1164,7 +1271,7 @@ class LRU(
         u1 = torch.rand(state_features)
         u2 = torch.rand(state_features)
         self.nu_log = nn.Parameter(
-            torch.log(-0.5 * torch.log(u1 * (rmax + rmin) * (rmax - rmin) + rmin**2))
+            torch.log(-0.5 * torch.log(u1 * (rmax + rmin) * (rmax - rmin) + rmin ** 2))
         )
         self.theta_log = nn.Parameter(torch.log(max_phase * u2))
         # self.theta_log = torch.log(max_phase * u2).to(self.nu_log.device)
@@ -1288,15 +1395,15 @@ class SSM(
 ):  # Implements LRU + a user-defined scaffolding, this is our SSM block.
     # Scaffolding can be modified. In this case we have LRU, MLP plus linear skip connection.
     def __init__(
-        self,
-        in_features,
-        out_features,
-        state_features,
-        scan,
-        mlp_hidden_size=15,
-        rmin=0.85,
-        rmax=0.9,
-        max_phase=6.283,
+            self,
+            in_features,
+            out_features,
+            state_features,
+            scan,
+            mlp_hidden_size=15,
+            rmin=0.85,
+            rmax=0.9,
+            max_phase=6.283,
     ):
         super().__init__()
         self.mlp = MLP(out_features, mlp_hidden_size, out_features)
@@ -1318,7 +1425,7 @@ class DeepLRU(
     nn.Module
 ):  # Implements a cascade of N SSMs. Linear pre- and post-processing can be modified
     def __init__(
-        self, N, in_features, out_features, mid_features, state_features, scan=True
+            self, N, in_features, out_features, mid_features, state_features, scan=True
     ):
         super().__init__()
         self.linin = nn.Linear(in_features, mid_features, bias=false)
@@ -1335,7 +1442,7 @@ class DeepLRU(
         # Apply the 'custom_method' to all elements except the first and last
         for i in range(1, len(self.modelt) - 1):
             if isinstance(
-                self.modelt[i], SSM
+                    self.modelt[i], SSM
             ):  # Check if it's an instance of CustomModule
                 self.modelt[i].set_paramS()  # Call the custom method
 
