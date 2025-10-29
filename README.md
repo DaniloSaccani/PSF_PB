@@ -173,8 +173,7 @@ If you use this repository in academic work, please cite:
 ```bibtex
 @article{psf_learning_control_2025,
   title   = {Learning-Based Control via Predictive Safety Filters},
-  author  = {...},
-  journal = {...},
+  author  = {Haoming Shen, Danilo Saccani, Luca Furieri, Giancarlo Ferrari-Trecate},
   year    = {2025},
   note    = {Preprint available at arXiv:XXXXX.XXXXX}
 }
