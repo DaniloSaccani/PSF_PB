@@ -20,10 +20,16 @@ Key idea:
 This repository reproduces:
 - closed-loop trajectories,
 - the paper plots (pendulum angle vs. time, cost \(J^\star\)),
+<p align="center">
+  <img src="figures/figure1_theta_error_overlay.png" width="320"/>
+</p>
+<p align="center">
+  <img src="figures/figure3_jstar.png" width="320"/>
+</p>
 - an animation of the pendulum avoiding the obstacle.
 
 <p align="center">
-  <img src="figures/pendulum.gif" width="320"/>
+  <img src="figures/pendulum_single.gif" width="320"/>
 </p>
 
 ---
