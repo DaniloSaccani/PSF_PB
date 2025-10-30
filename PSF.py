@@ -190,16 +190,19 @@ class MPCPredictSafetyFilter:
 
         # Define the solver options
         solver_opts = {
-            "ipopt.print_level": 0,  # no Ipopt iteration log
-            "ipopt.sb": "yes",  # silence Ipopt banner
-            "print_time": False,  # no CasADi timing line
-            "ipopt.max_iter": 200,  # (optional) keep solves snappy
+            "ipopt.print_level": 0,
+            "ipopt.sb": "yes",
+            "print_time": False,
+            "ipopt.max_iter": 500, # Increased from 200
             "ipopt.mu_strategy": "adaptive",
-            "ipopt.bound_relax_factor": 1e-8,
+            "ipopt.bound_relax_factor": 1e-8, # Helps with strict bounds
             "ipopt.nlp_scaling_method": "gradient-based",
-            "ipopt.tol": 1e-6,
-            "ipopt.hessian_approximation": "limited-memory",  # more forgiving
-            "ipopt.fixed_variable_treatment": "make_parameter"  # avoids some multipliers issues
+            "ipopt.tol": 1e-6, # Standard tolerance
+            "ipopt.constr_viol_tol": 1e-6, # Tolerance for constraint violation
+            "ipopt.acceptable_tol": 1e-5, # Allow slightly suboptimal if struggling
+            "ipopt.acceptable_constr_viol_tol": 1e-5, # Allow slight constraint violation if struggling
+            "ipopt.hessian_approximation": "limited-memory",
+            "ipopt.fixed_variable_treatment": "make_parameter"
         }
         self.opti.solver("ipopt", solver_opts)
 
