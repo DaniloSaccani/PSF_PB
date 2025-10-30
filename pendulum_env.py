@@ -58,17 +58,18 @@ class PendulumEnv:
         self.n = 2  # physical state dim
         self.m = 1  # control dim
 
-        # --- MODIFIED: Context dims ---
-        # context = [phi_t, obs_pos_x, obs_pos_y, obs_vel_x, obs_vel_y]
-        self.context_n = 1 + 2 + 2
-        self.aug_n = self.n + self.context_n  # augmented state dim
-        self.sim_horizon = float(sim_horizon)
+        # --- MODIFIED: Context dims (REMOVED phi_t) ---
+        # context = [obs_pos_x, obs_pos_y, obs_vel_x, obs_vel_y]
+        self.context_n = 2 + 2
+        self.aug_n = self.n + self.context_n  # augmented state dim (now 6)
+        # --- END MODIFIED ---
+
+        self.sim_horizon = float(sim_horizon)  # Still used for convergence bonus logic
         if obs_vel is None:
             self.obs_vel = torch.tensor([0.0, 0.0], dtype=torch.double)
         else:
             # Assuming 1 obstacle for simplicity, matching run.py
             self.obs_vel = obs_vel.reshape(-1).to(torch.double)
-        # --- END MODIFIED ---
 
         self.prestabilized = prestabilized
         self.disturbance = disturbance
@@ -200,7 +201,7 @@ class PendulumEnv:
         """
         Constructs the augmented state \tilde{x}_t = [x_t, c_t]
         where x_t = [theta, omega]
-        and   c_t = [phi_t, p_obs_x, p_obs_y, v_obs_x, v_obs_y]
+        and   c_t = [p_obs_x, p_obs_y, v_obs_x, v_obs_y]
         """
         # Ensure state is on the correct device
         default_device = self.state_limit_low.device
@@ -208,27 +209,27 @@ class PendulumEnv:
         # 1. Physical state (size 2)
         physical_state = self.state.squeeze(0).squeeze(0).to(default_device)
 
-        # 2. Context: phi_t (size 1)
-        phi_t = torch.tensor(
-            [self.t / self.sim_horizon],
-            dtype=torch.double,
-            device=default_device
-        )
+        # 2. Context: phi_t (REMOVED)
 
         # 3. Context: obs_pos_t (size 2)
-        # get_obstacles can be slow, but is necessary
-        obs_pos_t, _ = self.obstacle.get_obstacles(self.t)
+        # Clamp time index for obstacle lookup
+        max_obs_index = self.obstacle.positions.size(1) - 1
+        safe_t_index = min(self.t, max_obs_index)
+        obs_pos_t, _ = self.obstacle.get_obstacles(safe_t_index)
+
         obs_pos_flat = obs_pos_t.reshape(-1).to(torch.double).to(default_device)
 
         # 4. Context: obs_vel (size 2)
         obs_vel_flat = self.obs_vel.reshape(-1).to(torch.double).to(default_device)
 
+        # --- MODIFIED: torch.cat call (REMOVED phi_t) ---
         aug_state = torch.cat([
             physical_state,
-            phi_t,
             obs_pos_flat,
             obs_vel_flat
         ])
+        # --- END MODIFIED ---
+
         return aug_state.squeeze()  # Return shape (aug_n,)
 
     # --- END MODIFIED ---
