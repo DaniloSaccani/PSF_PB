@@ -9,7 +9,7 @@ plot_results.py (equilibrium-at-zero view)
   • Only LOWER θ bound (also mapped) is shown; y-lims are [lower_bound_error - 0.1, FIG1_MAXY].
   • Optional θ0 sweep overlay.
 - Figure 2: ρ_t (kept with title/legend).
-- Figure 3: J*(t) with shared anchor (NO title/legend).
+- Figure 3: J*(t) with shared anchor (NO title/legend), now with θ0 sweep overlay like Figure 1.
 - Figure 4: three subplots for the single θ0:
     (a) θ (error frame if enabled) and ω vs time
     (b) u_L vs applied u
@@ -35,8 +35,7 @@ from PSF import MPCPredictSafetyFilter
 
 # =================== HYPERPARAMETERS / USER SETTINGS =================
 # --- Run / model selection ---
-#RUN_FOLDER_NAME = "PSF_SSM_NS_10_29_12_30_09"  # results/<RUN_FOLDER_NAME>
-RUN_FOLDER_NAME = "PSF_SSM_NS_10_29_23_54_51"  # results/<RUN_FOLDER_NAME>
+RUN_FOLDER_NAME = "PSF_SSM_NS_10_30_11_17_51"  # results/<RUN_FOLDER_NAME>
 
 THETA0 = 1.57079632679  # single run initial angle [rad]; None -> π/2
 RHO_FIXED = 0.5  # baseline (and optional learned) fixed ρ
@@ -49,11 +48,11 @@ THETA_REF = np.pi  # desired equilibrium in absolute angle (π is upright)
 # --- Visual anchor for J* plot (baseline-derived “one-step increase”) ---
 PLOT_SHARED_ANCHOR = True
 
-# --- θ0 sweep (FIRST plot overlay only) ---
+# --- θ0 sweep (FIRST & THIRD plot overlays) ---
 ENABLE_THETA0_SWEEP = True  # set False to disable overlay
-THETA0_MIN = -2.6 + 3.14  # radians
-THETA0_MAX = 2.5 + 3.14#-0.2 + 3.14  # radians
-THETA0_N = 15  # number of θ0 samples in [min,max]
+THETA0_MIN = -2.6 + 3.14  # radians conversion for 0 in pi
+THETA0_MAX = 2.5 + 3.14  # radians conversion for 0 in pi
+THETA0_N = 3  # number of θ0 samples in [min,max]
 PLOT_BASELINE_IN_SWEEP = True  # overlay PSF-only curves (baseline)
 PLOT_LEARNED_IN_SWEEP = True  # overlay Actor+PSF curves (learned)
 rho_bar = 0.5
@@ -72,7 +71,7 @@ FIG1_XTICKS = None  # e.g., np.arange(0, 12.5, 2.5)
 FIG1_YTICKS = None  # e.g., [-3, -2, -1, 0, 1, 2, 3]
 FIG3_XTICKS = None
 FIG3_YTICKS = None
-FIG1_MAXY = max(0.86,2.7) # max y-limit for fig 1
+FIG1_MAXY = max(0.86, 2.7)  # max y-limit for fig 1
 
 # --- Colors (approaches & obstacle) ---
 COLOR_BASELINE = 'tab:orange'  # baseline (fixed ρ / rhobar)
@@ -156,7 +155,10 @@ def load_meta_from_log(log_path):
 meta = load_meta_from_log(LOG_PATH)
 
 # ---------- Defaults (match training script) ----------
-sim_horizon = int(meta.get('sim_horizon', 250))
+# --- MODIFIED: Renamed sim_horizon to train_horizon ---
+train_horizon = int(meta.get('sim_horizon', 250))
+plot_horizon = train_horizon + 50  # Define longer horizon for plotting
+# --- END MODIFIED ---
 epsilon = float(meta.get('epsilon', 0.05))
 DT = 0.05
 
@@ -223,7 +225,9 @@ else:
             f"[WARN] Log dim_internal={log_dim}, checkpoint shows {detected_dim}. Using {detected_dim} to match checkpoint.")
 
 # ---------- Build obstacle signal (same as training) ----------
-T_total = sim_horizon + 1 + 500
+# --- MODIFIED: Use plot_horizon for T_total ---
+T_total = plot_horizon + 1 + 500
+# --- END MODIFIED ---
 t = torch.arange(T_total, dtype=torch.double)
 obs_pos_raw = torch.tensor(obs_centers, dtype=torch.double) + (t[:, None] * DT) * torch.tensor(obs_vel,
                                                                                                dtype=torch.double)
@@ -249,10 +253,10 @@ env = PendulumEnv(
     epsilon=epsilon,
     rho=0.5, rho_bar=rho_bar, rho_max=rho_max,
     Qlyapunov=Qlyapunov, Rlyapunov=Rlyapunov,
-    # --- MODIFIED: Pass context args ---
-    sim_horizon=sim_horizon,
-    obs_vel=torch.tensor(obs_vel, dtype=torch.double)
+    # --- MODIFIED: Pass train_horizon to env ---
+    sim_horizon=train_horizon,
     # --- END MODIFIED ---
+    obs_vel=torch.tensor(obs_vel, dtype=torch.double)
 )
 
 # ---------- Controller with *matching* SSM size ----------
@@ -261,7 +265,9 @@ mad = MADController(
     buffer_capacity=100000,
     target_state=target_positions,
     num_dynamics_states=num_dynamics_states,
-    dynamics_input_time_window_length=sim_horizon + 1,
+    # --- MODIFIED: Pass train_horizon to controller ---
+    dynamics_input_time_window_length=train_horizon + 1,
+    # --- END MODIFIED ---
     batch_size=64,
     gamma=0.99, tau=0.005,
     actor_lr=5e-4, critic_lr=1e-3,
@@ -298,13 +304,12 @@ def make_psf(rho_mode, rho_fixed_val):
 
 
 # ---------- Helpers ----------
-#CHI2 = -2 ln(1-%)
-#safety margin
+# CHI2 = -2 ln(1-%)
+# safety margin
 CHI2_2_93 = 5.31852007387
 
 
-def wrap_pi(x):
-    """Wrap to (-pi, pi]."""
+def wrap_pi(x):  # Wrap to (-pi, pi]
     return (x + np.pi) % (2 * np.pi) - np.pi
 
 
@@ -318,7 +323,7 @@ def theta_arcs_hit_obstacle(center_xy, L, cov_var):
     if norm_c < 1e-12: return [(0.0, 2 * np.pi)]
     zeta = (L ** 2 + norm_c ** 2 - r ** 2) / (2.0 * L * norm_c)
     if zeta <= -1.0: return [(0.0, 2 * np.pi)]
-    if zeta >= 1.0: return []
+    if zeta >= 1.0:  return []
     delta = np.arccos(zeta);
     phi = np.arctan2(c[1], c[0])
     th_lo = wrap_0_2pi(phi - delta + np.pi / 2);
@@ -333,19 +338,15 @@ def rho_schedule_from_uL(uL_scalar, rho_bar, rho_max, epsilon):
 
 
 def arcs_absolute_to_error(arcs_abs, theta_ref):
-    """
-    Map absolute-θ arcs (each [θ_lo, θ_hi] in [0, 2π)) into error-θ arcs
-    over (-π, π] by subtracting theta_ref and wrapping. May split into two.
-    """
+    """Map absolute-θ arcs [θ_lo, θ_hi] in [0,2π) into error arcs over (-π,π] by subtracting theta_ref and wrapping."""
     out = []
     for th_lo, th_hi in arcs_abs:
-        lo_e = wrap_pi(th_lo - theta_ref)
+        lo_e = wrap_pi(th_lo - theta_ref);
         hi_e = wrap_pi(th_hi - theta_ref)
         if lo_e <= hi_e:
             out.append((lo_e, hi_e))
         else:
-            out.append((-np.pi, hi_e))
-            out.append((lo_e, np.pi))
+            out.append((-np.pi, hi_e)); out.append((lo_e, np.pi))
     return out
 
 
@@ -359,7 +360,9 @@ plant_single = SinglePendulum(
 theta_base, omega_base, u_cmd_base, rho_base, J_base = [THETA0], [0.0], [], [], []
 U_prev = X_prev = None
 x_t = torch.tensor([THETA0, 0.0], dtype=torch.double).view(1, 1, -1)
-for k in range(sim_horizon):
+# --- MODIFIED: Use plot_horizon ---
+for k in range(plot_horizon):
+    # --- END MODIFIED ---
     x_np = x_t.view(-1).cpu().numpy()
     uL = np.zeros((1,), dtype=float)
     try:
@@ -400,28 +403,28 @@ theta_learn, omega_learn, uL_log, u_cmd_learn, rho_learn, J_learn = [THETA0], [0
 U_prev = X_prev = None
 x_t = torch.tensor([THETA0, 0.0], dtype=torch.double).view(1, 1, -1)
 
-# --- MODIFIED: Manually init env and controller for aug_state ---
+# Manually init env and controller for aug_state
 env.state = x_t.clone().to(env.state_limit_low.device)
 env.t = 0
 aug_state_t = env._get_augmented_state().to(device)
 mad.set_ep_initial_state(initial_aug_state=aug_state_t)
-# --- END MODIFIED ---
 
 mad.reset_ep_timestep()
 mad.update_dynamics_input_time_window()
 mad.w = torch.zeros(mad.num_physical_states, dtype=torch.double).to(device)
 
-for k in range(sim_horizon):
+# --- MODIFIED: Use plot_horizon ---
+for k in range(plot_horizon):
+    # --- END MODIFIED ---
     x_np = x_t.view(-1).cpu().numpy()  # physical state for PSF
 
-    # --- MODIFIED: Get aug_state and call policy ---
+    # Get aug_state and call policy
     aug_state_t = env._get_augmented_state().to(device)
     uL_tensor = mad.learned_policy(
         aug_state_t,
         mad.dynamics_input_time_window,
         mad.dynamics_disturbance_time_window
     )
-    # --- END MODIFIED ---
 
     uL = np.asarray(uL_tensor, dtype=float).reshape(-1)
     uL_log.append(float(uL[0]))
@@ -449,10 +452,9 @@ for k in range(sim_horizon):
 
     x_t = plant_single_L.rk4_integration(x_t, torch.tensor(u_cmd, dtype=torch.double))
 
-    # --- MODIFIED: Update env state/time for next loop iter ---
+    # Update env state/time for next loop iter
     env.state = x_t.clone().to(env.state_limit_low.device)
     env.t += 1
-    # --- END MODIFIED ---
 
     x_vec = x_t.view(-1).cpu().numpy()
     theta_learn.append(float(x_vec[0]));
@@ -468,6 +470,15 @@ u_cmd_learn = np.array(u_cmd_learn)
 rho_learn = np.array(rho_learn);
 J_learn = np.array(J_learn)
 
+# ======================= PLOTTING (SAVE + SHOW) ========================
+# --- MODIFIED: Define t_states and t_inputs here using plot_horizon ---
+t_states = np.arange(plot_horizon + 1) * DT
+t_inputs = np.arange(plot_horizon) * DT
+# --- END MODIFIED ---
+SAFE_TH_LO = float(state_lower_bound[0])  # absolute lower bound (for frame shift)
+SAFE_TH_HI = float(state_upper_bound[0])  # absolute upper bound (for frame shift)
+RHO_T = r'$\rho_t$'
+
 
 # ---------- Visual anchor for J* plot (baseline-derived one-step increase) ----------
 def _angdiff(a, b):  # shortest angular difference a->b in [-pi, pi]
@@ -481,28 +492,47 @@ def _first_finite(x, default=0.0):
     return float(default)
 
 
+# --- MODIFIED: Calculate separate anchors ---
 if PLOT_SHARED_ANCHOR:
     e0 = np.array([_angdiff(THETA0, np.pi), 0.0], dtype=float)
-    u0 = np.array([0.0], dtype=float)
-    penalty0 = float(e0.T @ Qlyapunov @ e0 + u0.T @ Rlyapunov @ u0)
+    u0_base = np.array([0.0], dtype=float)  # Baseline uL is 0
+    u0_learn = np.array([_first_finite(uL_log, 0.0)], dtype=float)  # Learned uL
+
+    # Calculate penalty s(x_0, u_0) for each case
+    penalty0_base = float(e0.T @ Qlyapunov @ e0 + u0_base.T @ Rlyapunov @ u0_base)
+    # Note: The *learned* anchor uses the *learned* uL_0, but the *baseline* rho (RHO_FIXED)
+    # This is consistent with the paper's "one-step increase" idea.
+    penalty0_learn = float(e0.T @ Qlyapunov @ e0 + u0_learn.T @ Rlyapunov @ u0_learn)
+
     J0_base = _first_finite(J_base, default=0.0)
+    J0_learn = _first_finite(J_learn, default=0.0)
     eps_margin = 1e-6
-    J_anchor = J0_base + (1.0 - float(RHO_FIXED)) * penalty0 + eps_margin
-    t_inputs_plot = np.concatenate(([-DT], np.arange(sim_horizon) * DT))
-    J_base_plot = np.concatenate(([J_anchor], J_base))
-    J_learn_plot = np.concatenate(([J_anchor], J_learn))
+
+    # Anchor for baseline
+    J_anchor_base = J0_base + (1.0 - float(RHO_FIXED)) * penalty0_base + eps_margin
+    # Anchor for learned (uses its own J0 and penalty, but RHO_FIXED for "shared" logic)
+    J_anchor_learn = J0_learn + (1.0 - float(RHO_FIXED)) * penalty0_learn + eps_margin
+
+    # --- MODIFIED: Use t_inputs (which is already plot_horizon long) ---
+    t_inputs_plot = np.concatenate(([-DT], t_inputs))
+    # --- END MODIFIED ---
+    J_base_plot = np.concatenate(([J_anchor_base], J_base))
+    J_learn_plot = np.concatenate(([J_anchor_learn], J_learn))
 else:
-    t_inputs_plot = np.arange(sim_horizon) * DT
+    # --- MODIFIED: Use t_inputs (which is already plot_horizon long) ---
+    t_inputs_plot = t_inputs
+    # --- END MODIFIED ---
     J_base_plot = J_base
     J_learn_plot = J_learn
+# --- END MODIFIED ---
 
-# ---------- θ0 sweep simulations (FIRST plot only) ----------
-sweep_data = []  # list of dicts: {theta0, theta_base?, theta_learn?}
+# ---------- θ0 sweep simulations (Figure 1 and Figure 3 overlays) ----------
+sweep_data = []  # list of dicts: {theta0, theta_base?, theta_learn?, J_base?, J_learn?}
 if ENABLE_THETA0_SWEEP:
     theta0_grid = np.linspace(THETA0_MIN, THETA0_MAX, THETA0_N)
     for th0 in theta0_grid:
         record = {'theta0': float(th0)}
-        # Baseline sweep
+        # Baseline sweep (store theta and J)
         if PLOT_BASELINE_IN_SWEEP:
             psf_b = make_psf('fixed', RHO_FIXED)
             plant_b = SinglePendulum(
@@ -512,27 +542,35 @@ if ENABLE_THETA0_SWEEP:
             )
             x_t = torch.tensor([th0, 0.0], dtype=torch.double).view(1, 1, -1)
             tb = [th0];
+            Jb = []
             U_prev = X_prev = None
-            for k in range(sim_horizon):
+            # --- MODIFIED: Use plot_horizon ---
+            for k in range(plot_horizon):
+                # --- END MODIFIED ---
                 x_np = x_t.view(-1).cpu().numpy()
                 uL = np.zeros((1,), dtype=float)
                 try:
                     if k == 0:
-                        U_sol, X_sol, _ = psf_b.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL)
+                        U_sol, X_sol, J_curr = psf_b.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL)
                     else:
-                        U_sol, X_sol, _ = psf_b.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL, U_prev, X_prev)
+                        U_sol, X_sol, J_curr = psf_b.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL, U_prev,
+                                                               X_prev)
                 except Exception:
-                    U_sol = X_sol = None
+                    U_sol = X_sol = J_curr = None
                 if U_sol is None:
                     u_cmd = uL.reshape(1, 1, 1);
-                    U_prev = X_prev = None
+                    U_prev = X_prev = None;
+                    Jb.append(np.nan)
                 else:
                     u_cmd = U_sol[:, 0:1].reshape(1, 1, 1);
-                    U_prev, X_prev = U_sol, X_sol
+                    U_prev, X_prev = U_sol, X_sol;
+                    Jb.append(float(J_curr))
                 x_t = plant_b.rk4_integration(x_t, torch.tensor(u_cmd, dtype=torch.double))
                 tb.append(float(x_t.view(-1)[0]))
-            record['theta_base'] = np.array(tb)
-        # Learned sweep
+            record['theta_base'] = np.array(tb);
+            record['J_base'] = np.array(Jb)
+
+        # Learned sweep (store theta and J)
         if PLOT_LEARNED_IN_SWEEP:
             psf_l = make_psf(LEARNED_RHO_MODE, RHO_FIXED)
             plant_l = SinglePendulum(
@@ -542,65 +580,60 @@ if ENABLE_THETA0_SWEEP:
             )
             x_t = torch.tensor([th0, 0.0], dtype=torch.double).view(1, 1, -1)
 
-            # --- MODIFIED: Manually init env and controller for aug_state ---
+            # Reset env/actor episode state
             env.state = x_t.clone().to(env.state_limit_low.device)
             env.t = 0
             aug_state_t = env._get_augmented_state().to(device)
             mad.set_ep_initial_state(initial_aug_state=aug_state_t)
-            # --- END MODIFIED ---
-
             mad.reset_ep_timestep()
             mad.update_dynamics_input_time_window()
             mad.w = torch.zeros(mad.num_physical_states, dtype=torch.double).to(device)
 
             tl = [th0];
+            Jl = [];
+            uL_log_sweep = []
             U_prev = X_prev = None
-            for k in range(sim_horizon):
+            # --- MODIFIED: Use plot_horizon ---
+            for k in range(plot_horizon):
+                # --- END MODIFIED ---
                 x_np = x_t.view(-1).cpu().numpy()
-
-                # --- MODIFIED: Get aug_state and call policy ---
                 aug_state_t = env._get_augmented_state().to(device)
                 uL_tensor = mad.learned_policy(
                     aug_state_t,
                     mad.dynamics_input_time_window,
                     mad.dynamics_disturbance_time_window
                 )
-                # --- END MODIFIED ---
-
                 uL = np.asarray(uL_tensor, dtype=float).reshape(-1)
+                uL_log_sweep.append(float(uL[0]))  # Store uL_0
                 try:
                     if k == 0:
-                        U_sol, X_sol, _ = psf_l.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL)
+                        U_sol, X_sol, J_curr = psf_l.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL)
                     else:
-                        U_sol, X_sol, _ = psf_l.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL, U_prev, X_prev)
+                        U_sol, X_sol, J_curr = psf_l.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL, U_prev,
+                                                               X_prev)
                 except Exception:
-                    U_sol = X_sol = None
+                    U_sol = X_sol = J_curr = None
                 if U_sol is None:
                     u_cmd = uL.reshape(1, 1, 1);
-                    U_prev = X_prev = None
+                    U_prev = X_prev = None;
+                    Jl.append(np.nan)
                 else:
                     u_cmd = U_sol[:, 0:1].reshape(1, 1, 1);
-                    U_prev, X_prev = U_sol, X_sol
+                    U_prev, X_prev = U_sol, X_sol;
+                    Jl.append(float(J_curr))
 
                 x_t = plant_l.rk4_integration(x_t, torch.tensor(u_cmd, dtype=torch.double))
-
-                # --- MODIFIED: Update env state/time for next loop iter ---
                 env.state = x_t.clone().to(env.state_limit_low.device)
                 env.t += 1
-                # --- END MODIFIED ---
 
                 tl.append(float(x_t.view(-1)[0]))
                 mad.update_ep_timestep()
                 mad.update_dynamics_input_time_window()
-            record['theta_learn'] = np.array(tl)
-        sweep_data.append(record)
+            record['theta_learn'] = np.array(tl);
+            record['J_learn'] = np.array(Jl)
+            record['uL0_learn'] = _first_finite(uL_log_sweep, 0.0)  # Store first learned uL
 
-# ======================= PLOTTING (SAVE + SHOW) ========================
-t_states = np.arange(sim_horizon + 1) * DT
-t_inputs = np.arange(sim_horizon) * DT
-SAFE_TH_LO = float(state_lower_bound[0])  # absolute lower bound (for frame shift)
-SAFE_TH_HI = float(state_upper_bound[0])  # absolute lower bound (for frame shift)
-RHO_T = r'$\rho_t$'
+        sweep_data.append(record)
 
 
 # --- Build error-frame versions for single-run traces (if enabled) ---
@@ -611,10 +644,9 @@ def to_error(arr_abs):
 theta_base_err = to_error(theta_base)
 theta_learn_err = to_error(theta_learn)
 
-# error-frame lower bound
-SAFE_TH_LO_ERR = to_error(np.array([SAFE_TH_LO]))[0]  # scalar
-SAFE_TH_HI_ERR = to_error(np.array([SAFE_TH_HI]))[0]  # scalar
-
+# error-frame lower/upper bounds
+SAFE_TH_LO_ERR = to_error(np.array([SAFE_TH_LO]))[0]
+SAFE_TH_HI_ERR = to_error(np.array([SAFE_TH_HI]))[0]
 
 # 1) θ̃(t) with obstacle band + θ0 sweep overlay (NO title/legend)
 fig1, ax1 = plt.subplots(figsize=FIG1_SIZE)
@@ -651,7 +683,9 @@ ax1.set_ylabel(r"$\theta$ [rad]" if SHIFT_TO_ERROR_FRAME else r"$\theta$ [rad]",
 ax1.set_ylim([SAFE_TH_LO_ERR - 0.1, FIG1_MAXY])  # requested y-lims
 
 # Obstacle shading — convert arcs to error frame before filling
-for k in range(sim_horizon):
+# --- MODIFIED: Use plot_horizon ---
+for k in range(plot_horizon):
+    # --- END MODIFIED ---
     centers_k = obs_centers + (k * DT) * obs_vel
     for i in range(centers_k.shape[0]):
         arcs_abs = theta_arcs_hit_obstacle(centers_k[i], L_link, cov_var=float(obs_covs[i]))
@@ -675,8 +709,8 @@ print(f"[Saved] {fig1_path}")
 
 # 2) ρ_t (single-run) — keep title/legend (unchanged by frame)
 fig2, ax2 = plt.subplots(figsize=(10, 4.6))
-ax2.plot(t_inputs[:rho_base.shape[0]], rho_base, label='PSF-only ' + RHO_T + ' (baseline fixed)',
-         lw=1.8, color=COLOR_BASELINE)
+ax2.plot(t_inputs[:rho_base.shape[0]], rho_base, label='PSF-only ' + RHO_T + ' (baseline fixed)', lw=1.8,
+         color=COLOR_BASELINE)
 ax2.plot(t_inputs[:rho_learn.shape[0]], rho_learn,
          label=(
              'Actor ' + RHO_T + ' (scheduled)' if LEARNED_RHO_MODE == 'scheduled' else 'Actor ' + RHO_T + ' (fixed)'),
@@ -689,12 +723,57 @@ ax2.legend(loc='best')
 ax2.tick_params(axis='both', labelsize=TICK_LABEL_FONTSIZE)
 fig2.tight_layout()
 
-# 3) J*(t) with shared anchor (single-run) — NO title/legend
+# 3) J*(t) with shared anchor — θ0 sweep overlay like Figure 1 (NO title/legend)
 fig3, ax3 = plt.subplots(figsize=FIG3_SIZE)
+
+# Sweep overlay for J*: per-theta0 shared anchor so baseline/learned comparable
+if ENABLE_THETA0_SWEEP and len(sweep_data) > 0:
+    sweep_sorted = sorted(sweep_data, key=lambda d: d['theta0'])
+    n = len(sweep_sorted)
+    alpha_min, alpha_max = 0.25, 0.90
+    for idx, d in enumerate(sweep_sorted):
+        a = alpha_min + (alpha_max - alpha_min) * (idx / (n - 1)) if n > 1 else 0.6
+
+        # --- MODIFIED: Calculate separate anchors for sweep ---
+        th0 = d['theta0']
+        e0 = np.array([_angdiff(th0, np.pi), 0.0], dtype=float)
+
+        # Baseline J sweep
+        if PLOT_BASELINE_IN_SWEEP and ('J_base' in d):
+            u0_base_local = np.array([0.0], dtype=float)
+            penalty0_base_local = float(e0.T @ Qlyapunov @ e0 + u0_base_local.T @ Rlyapunov @ u0_base_local)
+            J0_base_local = _first_finite(d.get('J_base', []), default=0.0)
+            J_anchor_base_local = J0_base_local + (
+                        1.0 - float(RHO_FIXED)) * penalty0_base_local + 1e-6 if PLOT_SHARED_ANCHOR else 0.0
+
+            Jb = d['J_base'];
+            Jb_plot = np.concatenate(([J_anchor_base_local], Jb)) if PLOT_SHARED_ANCHOR else Jb
+            # --- MODIFIED: Use t_inputs (plot_horizon) for sweep plot anchor ---
+            t_plot = np.concatenate(([-DT], t_inputs)) if PLOT_SHARED_ANCHOR else t_inputs
+            # --- END MODIFIED ---
+            ax3.plot(t_plot[:Jb_plot.shape[0]], Jb_plot, ls='--', lw=1.0, color=COLOR_BASELINE, alpha=a, label=None)
+
+        # Learned J sweep
+        if PLOT_LEARNED_IN_SWEEP and ('J_learn' in d):
+            u0_learn_local = np.array([d.get('uL0_learn', 0.0)], dtype=float)
+            penalty0_learn_local = float(e0.T @ Qlyapunov @ e0 + u0_learn_local.T @ Rlyapunov @ u0_learn_local)
+            J0_learn_local = _first_finite(d.get('J_learn', []), default=0.0)
+            J_anchor_learn_local = J0_learn_local + (
+                        1.0 - float(RHO_FIXED)) * penalty0_learn_local + 1e-6 if PLOT_SHARED_ANCHOR else 0.0
+
+            Jl = d['J_learn'];
+            Jl_plot = np.concatenate(([J_anchor_learn_local], Jl)) if PLOT_SHARED_ANCHOR else Jl
+            # --- MODIFIED: Use t_inputs (plot_horizon) for sweep plot anchor ---
+            t_plot = np.concatenate(([-DT], t_inputs)) if PLOT_SHARED_ANCHOR else t_inputs
+            # --- END MODIFIED ---
+            ax3.plot(t_plot[:Jl_plot.shape[0]], Jl_plot, ls='-', lw=1.0, color=COLOR_LEARNED, alpha=a, label=None)
+        # --- END MODIFIED ---
+
+# Single-run thick lines
 ax3.plot(t_inputs_plot[:J_base_plot.shape[0]], J_base_plot, lw=1.8, color=COLOR_BASELINE)
 ax3.plot(t_inputs_plot[:J_learn_plot.shape[0]], J_learn_plot, lw=1.8, color=COLOR_LEARNED)
 ax3.set_xlabel("time [s]", fontsize=AXIS_LABEL_FONTSIZE)
-ax3.set_ylabel(r"$J^*", fontsize=AXIS_LABEL_FONTSIZE)
+ax3.set_ylabel(r"$J^*$", fontsize=AXIS_LABEL_FONTSIZE)
 ax3.grid(True, alpha=0.3)
 ax3.tick_params(axis='both', labelsize=TICK_LABEL_FONTSIZE)
 if FIG3_XTICKS is not None: ax3.set_xticks(FIG3_XTICKS)
@@ -702,27 +781,22 @@ if FIG3_YTICKS is not None: ax3.set_yticks(FIG3_YTICKS)
 fig3.tight_layout()
 
 # Save Figure 3
-fig3_path = os.path.join(PLOTS_DIR, "figure3_jstar.png")
+fig3_path = os.path.join(PLOTS_DIR, "figure3_jstar_overlay.png")
 fig3.savefig(fig3_path, dpi=SAVE_DPI, bbox_inches='tight')
 print(f"[Saved] {fig3_path}")
 
-# 4) NEW: Figure 4 — 3 subplots for the single θ0
-#    (a) θ (error frame if enabled) and ω
-#    (b) u_L vs applied u
-#    (c) (u_L - u) for learned
+# 4) Figure 4 — 3 subplots for the single θ0
 fig4, axes = plt.subplots(1, 3, figsize=(16, 4.6), sharex=False)
 
 # (a) θ & ω vs time
 ax_a = axes[0]
-ax_a.plot(t_states, theta_base_err, lw=1.6, color=COLOR_BASELINE,
-          label=r'$\theta$ baseline' if SHIFT_TO_ERROR_FRAME else r'$\theta$ baseline')
-ax_a.plot(t_states, theta_learn_err, lw=1.6, color=COLOR_LEARNED,
-          label=r'$\theta$ learned' if SHIFT_TO_ERROR_FRAME else r'$\theta$ learned')
+ax_a.plot(t_states, theta_base_err, lw=1.6, color=COLOR_BASELINE, label=r'$\theta$ baseline')
+ax_a.plot(t_states, theta_learn_err, lw=1.6, color=COLOR_LEARNED, label=r'$\theta$ learned')
 ax_a.plot(t_states, omega_base, lw=1.2, ls='--', color=COLOR_BASELINE, alpha=0.75, label=r'$\omega$ baseline')
 ax_a.plot(t_states, omega_learn, lw=1.2, ls='--', color=COLOR_LEARNED, alpha=0.75, label=r'$\omega$ learned')
 ax_a.axhline(0.0, linestyle=':', linewidth=0.9, color='k', alpha=0.9)
 ax_a.set_xlabel("time [s]")
-ax_a.set_ylabel(r"$\theta$, $\omega$" if SHIFT_TO_ERROR_FRAME else r"$\theta$, $\omega$")
+ax_a.set_ylabel(r"$\theta$, $\omega$")
 ax_a.grid(True, alpha=0.3)
 ax_a.legend(loc='best', fontsize=10)
 
@@ -744,7 +818,6 @@ ax_b.legend(loc='best', fontsize=10)
 ax_c = axes[2]
 diff_learn = uL_log - u_cmd_learn
 ax_c.plot(t_inputs, diff_learn, lw=1.8, color=COLOR_LEARNED, label=r'$u_L - u$ (learned)')
-# optional: baseline diff (which is 0 - u_cmd_base = -u_cmd_base)
 ax_c.plot(t_inputs, -u_cmd_base, lw=1.2, color=COLOR_BASELINE, ls='--', alpha=0.8, label=r'$-u$ baseline')
 ax_c.axhline(0.0, linestyle=':', linewidth=0.9, color='k', alpha=0.9)
 ax_c.set_xlabel("time [s]")
