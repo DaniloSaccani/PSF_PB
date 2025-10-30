@@ -18,7 +18,7 @@ from single_pendulum_sys import SinglePendulum, SinglePendulumCasadi
 from PSF import MPCPredictSafetyFilter
 
 # ----------------------------- 0) MODE & PATHS -----------------------------
-START_MODE = "resume"   # "scratch" or "resume"
+START_MODE = "scratch"   # "scratch" or "resume"
 RESUME_RUN_FOLDER = "PSF_SSM_NS_10_29_12_30_09"
 
 # ---------------- 0bis) Hyperparameters & Reproducibility ------------------
@@ -39,7 +39,7 @@ alpha_cer               = 0.2
 
 epsilon           = 0.05
 dim_internal      = 10
-num_epochs        = 1500
+num_epochs        = 350
 
 obs_centers       = torch.tensor([[1.0, 0.5]])
 obs_covs          = torch.tensor([0.005])            # isotropic variance σ²
@@ -238,7 +238,7 @@ env = PendulumEnv(
     horizon = PSFhorizon,
     final_convergence_window=(sim_horizon-50, sim_horizon),
     convergence_theta_tol=0.05,
-    convergence_omega_tol=0.30,
+    convergence_omega_tol=0.1,
     convergence_hold_steps=20,
     convergence_bonus=50,#15.0,
     use_ramped_state_weight=False,
