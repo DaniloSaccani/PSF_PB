@@ -36,7 +36,7 @@ from PSF import MPCPredictSafetyFilter
 # =================== HYPERPARAMETERS / USER SETTINGS =================
 # --- Run / model selection ---
 #RUN_FOLDER_NAME = "PSF_SSM_NS_10_29_12_30_09"  # results/<RUN_FOLDER_NAME>
-RUN_FOLDER_NAME = "PSF_SSM_NS_10_29_13_41_21"  # results/<RUN_FOLDER_NAME>
+RUN_FOLDER_NAME = "PSF_SSM_NS_10_29_23_54_51"  # results/<RUN_FOLDER_NAME>
 
 THETA0 = 1.57079632679  # single run initial angle [rad]; None -> π/2
 RHO_FIXED = 0.5  # baseline (and optional learned) fixed ρ
@@ -51,9 +51,9 @@ PLOT_SHARED_ANCHOR = True
 
 # --- θ0 sweep (FIRST plot overlay only) ---
 ENABLE_THETA0_SWEEP = True  # set False to disable overlay
-THETA0_MIN = -2.5 + 3.14  # radians
-THETA0_MAX = -0.7 + 3.14  # radians
-THETA0_N = 5  # number of θ0 samples in [min,max]
+THETA0_MIN = -2.6 + 3.14  # radians
+THETA0_MAX = 2.5 + 3.14#-0.2 + 3.14  # radians
+THETA0_N = 15  # number of θ0 samples in [min,max]
 PLOT_BASELINE_IN_SWEEP = True  # overlay PSF-only curves (baseline)
 PLOT_LEARNED_IN_SWEEP = True  # overlay Actor+PSF curves (learned)
 rho_bar = 0.5
@@ -72,7 +72,7 @@ FIG1_XTICKS = None  # e.g., np.arange(0, 12.5, 2.5)
 FIG1_YTICKS = None  # e.g., [-3, -2, -1, 0, 1, 2, 3]
 FIG3_XTICKS = None
 FIG3_YTICKS = None
-FIG1_MAXY = 0.86  # max y-limit for fig 1
+FIG1_MAXY = max(0.86,2.7) # max y-limit for fig 1
 
 # --- Colors (approaches & obstacle) ---
 COLOR_BASELINE = 'tab:orange'  # baseline (fixed ρ / rhobar)
@@ -298,7 +298,9 @@ def make_psf(rho_mode, rho_fixed_val):
 
 
 # ---------- Helpers ----------
-CHI2_2_95 = 5.991464547
+#CHI2 = -2 ln(1-%)
+#safety margin
+CHI2_2_93 = 5.31852007387
 
 
 def wrap_pi(x):
@@ -310,7 +312,7 @@ def wrap_0_2pi(x): return np.mod(x, 2 * np.pi)
 
 
 def theta_arcs_hit_obstacle(center_xy, L, cov_var):
-    r = np.sqrt(CHI2_2_95 * float(cov_var))
+    r = np.sqrt(CHI2_2_93 * float(cov_var))
     c = np.asarray(center_xy, dtype=float).reshape(2, )
     norm_c = np.linalg.norm(c)
     if norm_c < 1e-12: return [(0.0, 2 * np.pi)]
@@ -597,6 +599,7 @@ if ENABLE_THETA0_SWEEP:
 t_states = np.arange(sim_horizon + 1) * DT
 t_inputs = np.arange(sim_horizon) * DT
 SAFE_TH_LO = float(state_lower_bound[0])  # absolute lower bound (for frame shift)
+SAFE_TH_HI = float(state_upper_bound[0])  # absolute lower bound (for frame shift)
 RHO_T = r'$\rho_t$'
 
 
@@ -608,8 +611,10 @@ def to_error(arr_abs):
 theta_base_err = to_error(theta_base)
 theta_learn_err = to_error(theta_learn)
 
-# error-frame lower bound (only show lower)
+# error-frame lower bound
 SAFE_TH_LO_ERR = to_error(np.array([SAFE_TH_LO]))[0]  # scalar
+SAFE_TH_HI_ERR = to_error(np.array([SAFE_TH_HI]))[0]  # scalar
+
 
 # 1) θ̃(t) with obstacle band + θ0 sweep overlay (NO title/legend)
 fig1, ax1 = plt.subplots(figsize=FIG1_SIZE)
@@ -635,12 +640,13 @@ ax1.plot(t_states[:theta_learn_err.shape[0]], theta_learn_err, lw=2.2, color=COL
 # Reference line at θ̃=0 (equilibrium at zero)
 ax1.axhline(0.0, linestyle='--', linewidth=1.0, color='k')
 
-# Lower bound only (error frame)
+# Lower and upper bound (error frame)
 ax1.axhline(SAFE_TH_LO_ERR, color='k', lw=0.8, ls=':')
+ax1.axhline(SAFE_TH_HI_ERR, color='k', lw=0.8, ls=':')
 
 # Labels and limits
 ax1.set_xlabel("time [s]", fontsize=AXIS_LABEL_FONTSIZE)
-ax1.set_ylabel(r"$\tilde{\theta}$ [rad]" if SHIFT_TO_ERROR_FRAME else r"$\theta$ [rad]",
+ax1.set_ylabel(r"$\theta$ [rad]" if SHIFT_TO_ERROR_FRAME else r"$\theta$ [rad]",
                fontsize=AXIS_LABEL_FONTSIZE)
 ax1.set_ylim([SAFE_TH_LO_ERR - 0.1, FIG1_MAXY])  # requested y-lims
 
@@ -688,7 +694,7 @@ fig3, ax3 = plt.subplots(figsize=FIG3_SIZE)
 ax3.plot(t_inputs_plot[:J_base_plot.shape[0]], J_base_plot, lw=1.8, color=COLOR_BASELINE)
 ax3.plot(t_inputs_plot[:J_learn_plot.shape[0]], J_learn_plot, lw=1.8, color=COLOR_LEARNED)
 ax3.set_xlabel("time [s]", fontsize=AXIS_LABEL_FONTSIZE)
-ax3.set_ylabel(r"$J^\star$", fontsize=AXIS_LABEL_FONTSIZE)
+ax3.set_ylabel(r"$J^*", fontsize=AXIS_LABEL_FONTSIZE)
 ax3.grid(True, alpha=0.3)
 ax3.tick_params(axis='both', labelsize=TICK_LABEL_FONTSIZE)
 if FIG3_XTICKS is not None: ax3.set_xticks(FIG3_XTICKS)
@@ -709,14 +715,14 @@ fig4, axes = plt.subplots(1, 3, figsize=(16, 4.6), sharex=False)
 # (a) θ & ω vs time
 ax_a = axes[0]
 ax_a.plot(t_states, theta_base_err, lw=1.6, color=COLOR_BASELINE,
-          label=r'$\tilde{\theta}$ baseline' if SHIFT_TO_ERROR_FRAME else r'$\theta$ baseline')
+          label=r'$\theta$ baseline' if SHIFT_TO_ERROR_FRAME else r'$\theta$ baseline')
 ax_a.plot(t_states, theta_learn_err, lw=1.6, color=COLOR_LEARNED,
-          label=r'$\tilde{\theta}$ learned' if SHIFT_TO_ERROR_FRAME else r'$\theta$ learned')
+          label=r'$\theta$ learned' if SHIFT_TO_ERROR_FRAME else r'$\theta$ learned')
 ax_a.plot(t_states, omega_base, lw=1.2, ls='--', color=COLOR_BASELINE, alpha=0.75, label=r'$\omega$ baseline')
 ax_a.plot(t_states, omega_learn, lw=1.2, ls='--', color=COLOR_LEARNED, alpha=0.75, label=r'$\omega$ learned')
 ax_a.axhline(0.0, linestyle=':', linewidth=0.9, color='k', alpha=0.9)
 ax_a.set_xlabel("time [s]")
-ax_a.set_ylabel(r"$\tilde{\theta}$, $\omega$" if SHIFT_TO_ERROR_FRAME else r"$\theta$, $\omega$")
+ax_a.set_ylabel(r"$\theta$, $\omega$" if SHIFT_TO_ERROR_FRAME else r"$\theta$, $\omega$")
 ax_a.grid(True, alpha=0.3)
 ax_a.legend(loc='best', fontsize=10)
 
