@@ -39,7 +39,7 @@ alpha_cer               = 0.2
 
 epsilon           = 0.05
 dim_internal      = 10
-num_epochs        = 150
+num_epochs        = 1500
 
 obs_centers       = torch.tensor([[1.0, 0.5]])
 obs_covs          = torch.tensor([0.005])            # isotropic variance σ²
@@ -55,6 +55,7 @@ start_position    = np.pi / 2
 
 noise_std         = 0.8
 theta0_low, theta0_high = 3.14 - 2.3, 3.14 - 1
+theta0_low, theta0_high = 3.14 - 2.3, 3.14 +2.3
 decayExpNoise     = 0.95
 PSFhorizon        = 20
 
@@ -236,11 +237,11 @@ env = PendulumEnv(
     Rlyapunov=Rlyapunov,
     horizon = PSFhorizon,
     final_convergence_window=(sim_horizon-50, sim_horizon),
-    convergence_theta_tol=0.1,
+    convergence_theta_tol=0.05,
     convergence_omega_tol=0.30,
-    convergence_hold_steps=10,
-    convergence_bonus=15.0,
-    use_ramped_state_weight=True,
+    convergence_hold_steps=20,
+    convergence_bonus=50,#15.0,
+    use_ramped_state_weight=False,
     state_weight_warmup=0.20,
     # --- MODIFIED: Pass context info ---
     sim_horizon=sim_horizon,
