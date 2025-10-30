@@ -277,6 +277,24 @@ class PendulumEnv:
 
         # losses (match dtypes/devices)
         loss_states = lf.loss_state_tracking(self.state.squeeze(0).squeeze(0), self.target_positions, self.Q)
+        # T_switch = 2/0.05
+        # # --- MODIFIED: Time-varying target for learner ---
+        # current_physical_state = self.state.squeeze(0).squeeze(0)  # Get physical state [theta, omega]
+        #
+        # if self.t < T_switch:
+        #     # Use temporary target for the first T_switch steps
+        #     target_temp = torch.tensor([np.pi - 2.6, 0.0], dtype=torch.double, device=current_physical_state.device)
+        #     loss_states = lf.loss_state_tracking(current_physical_state, target_temp, self.Q)
+        # else:
+        #     # Use the final target after T_switch steps
+        #    loss_states = lf.loss_state_tracking(current_physical_state, self.target_positions, self.Q)
+        # --- END MODIFIED ---
+
+        # The rest of the reward calculation uses this potentially time-varying loss_states
+        alpha_state_eff = self.alpha_state
+        # ... (ramped weight logic remains the same) ...
+        self.step_reward_state_error = - alpha_state_eff * loss_states
+
         alpha_state_eff = self.alpha_state
         if self.use_ramped_state_weight:
             t0, t1 = self.final_window_start, self.final_window_end
