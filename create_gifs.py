@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-make_pendulum_gif_single.py
+make_pendulum_gif_sweep.py
 
 - Loads results/<RUN_FOLDER_NAME>/model_best.pth (best actor)
 - Rebuilds env + controller, generates u_L online from the actor
-- Runs PSF forward (learned only) for ONE realization (theta0)
-- Saves a 2D GIF: pendulum motion + obstacle drawn as 95% PDF disk
+- Runs PSF forward (learned only) for MULTIPLE realizations (theta0_min to theta0_max)
+- Saves one 2D GIF for each realization.
 
-Run: python make_pendulum_gif_single.py
+Run: python create_gifs.py
 """
 
 # =================== USER SETTINGS (manual, like your plot script) ===================
-RUN_FOLDER_NAME = "PSF_SSM_NS_10_29_12_30_09"  # results/<RUN_FOLDER_NAME>
-THETA0 = -0.7 + 3.14  # 1.57079632679                # initial angle [rad]; None -> π/2
+RUN_FOLDER_NAME = "saved_model_for_figure"  # results/<RUN_FOLDER_NAME>
+
+# --- MODIFIED: Sweep settings ---
+THETA0_MIN = -2.5 + 3.14  # radians
+THETA0_MAX = 2.4 + 3.14  # radians
+THETA0_N = 10  # number of GIFs to create
+# --- END MODIFIED ---
+
 LEARNED_RHO_MODE = "scheduled"  # "scheduled" or "fixed"
 RHO_FIXED = 0.5  # used only if LEARNED_RHO_MODE == "fixed"
 
@@ -21,9 +27,11 @@ RHO_FIXED = 0.5  # used only if LEARNED_RHO_MODE == "fixed"
 rho_bar = 0.5
 rho_max = 10.0
 PSFhorizon = 20
+ADDITIONAL_SIMPLOT = 0
+
 
 # Output GIF
-GIF_PATH = "results/gifs/pendulum_single.gif"
+GIF_DIR = "results/gifs"  # Base directory for GIFs
 FPS = 20
 
 # ===============================================================================
@@ -51,7 +59,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, "results", RUN_FOLDER_NAME)
 BEST_PATH = os.path.join(RESULTS_DIR, "model_best.pth")
 LOG_PATH = os.path.join(RESULTS_DIR, "training.log")
-os.makedirs(os.path.dirname(GIF_PATH), exist_ok=True)
+
+# --- MODIFIED: Create a sub-directory for this run's GIFs ---
+GIF_DIR_RUN = os.path.join(BASE_DIR, GIF_DIR, RUN_FOLDER_NAME)
+os.makedirs(GIF_DIR_RUN, exist_ok=True)
+# --- END MODIFIED ---
 
 if not os.path.exists(RESULTS_DIR):
     raise FileNotFoundError(f"Results dir not found: {RESULTS_DIR}")
@@ -116,7 +128,10 @@ def load_meta_from_log(log_path):
 meta = load_meta_from_log(LOG_PATH)
 
 # ---------- Defaults (match training) ----------
-sim_horizon = int(meta.get('sim_horizon', 250))
+# --- MODIFIED: Use train_horizon and plot_horizon ---
+train_horizon = int(meta.get('sim_horizon', 250))
+plot_horizon = train_horizon + ADDITIONAL_SIMPLOT  # Simulate for 50 extra steps
+# --- END MODIFIED ---
 epsilon = float(meta.get('epsilon', 0.05))
 DT = 0.05
 
@@ -127,9 +142,6 @@ control_upper_bound = np.array(meta.get('control_upper_bound', [3.0]), dtype=flo
 obs_centers = np.array(meta.get('obs_centers', [[1.0, 0.5]]), dtype=float).reshape(-1, 2)
 obs_covs = np.array(meta.get('obs_covs', [0.005]), dtype=float).reshape(-1)
 obs_vel = np.array(meta.get('obs_vel', [[-0.2, 0.0]]), dtype=float).reshape(-1, 2)
-
-if THETA0 is None:
-    THETA0 = np.pi / 2
 
 
 # ---------- Auto-detect SSM size from checkpoint ----------
@@ -182,7 +194,9 @@ else:
         print(f"[WARN] Log dim_internal={log_dim}, checkpoint shows {detected_dim}. Using {detected_dim}.")
 
 # ---------- Obstacle signal ----------
-T_total = sim_horizon + 1 + 500
+# --- MODIFIED: Use plot_horizon ---
+T_total = plot_horizon + 1 + 500
+# --- END MODIFIED ---
 t = torch.arange(T_total, dtype=torch.double)
 obs_pos_raw = torch.tensor(obs_centers, dtype=torch.double) + (t[:, None] * DT) * torch.tensor(obs_vel,
                                                                                                dtype=torch.double)
@@ -196,8 +210,8 @@ Rlyapunov = np.array([[r_u]], dtype=float)
 target_positions = torch.tensor([np.pi, 0.0], dtype=torch.double)
 
 env = PendulumEnv(
-    initial_state_low=torch.tensor([THETA0, 0.0], dtype=torch.double),
-    initial_state_high=torch.tensor([THETA0, 0.0], dtype=torch.double),
+    initial_state_low=torch.tensor([THETA0_MIN, 0.0], dtype=torch.double),
+    initial_state_high=torch.tensor([THETA0_MAX, 0.0], dtype=torch.double),
     state_limit_low=torch.tensor(state_lower_bound, dtype=torch.double),
     state_limit_high=torch.tensor(state_upper_bound, dtype=torch.double),
     control_limit_low=torch.tensor(control_lower_bound, dtype=torch.double),
@@ -208,10 +222,10 @@ env = PendulumEnv(
     epsilon=epsilon,
     rho=0.5, rho_bar=rho_bar, rho_max=rho_max,
     Qlyapunov=Qlyapunov, Rlyapunov=Rlyapunov,
-    # --- MODIFIED: Pass context args ---
-    sim_horizon=sim_horizon,
-    obs_vel=torch.tensor(obs_vel, dtype=torch.double)
+    # --- MODIFIED: Pass train_horizon ---
+    sim_horizon=train_horizon,
     # --- END MODIFIED ---
+    obs_vel=torch.tensor(obs_vel, dtype=torch.double)
 )
 
 # ---------- Controller ----------
@@ -220,7 +234,9 @@ mad = MADController(
     buffer_capacity=100000,
     target_state=target_positions,
     num_dynamics_states=num_dynamics_states,
-    dynamics_input_time_window_length=sim_horizon + 1,
+    # --- MODIFIED: Pass train_horizon ---
+    dynamics_input_time_window_length=train_horizon + 1,
+    # --- END MODIFIED ---
     batch_size=64,
     gamma=0.99, tau=0.005,
     actor_lr=5e-4, critic_lr=1e-3,
@@ -255,7 +271,9 @@ def make_psf(rho_mode, rho_fixed_val):
 
 
 # ---------- Helpers ----------
-CHI2_2_95 = 5.991464547107979
+# CHI2 = -2 ln(1-%)
+# with safety margin e.g., CHI2_2_95 = 5.991464547107979
+CHI2_2_93 = 5.31852007387
 
 
 def rho_schedule_from_uL(uL_scalar, rho_bar, rho_max, epsilon):
@@ -264,135 +282,155 @@ def rho_schedule_from_uL(uL_scalar, rho_bar, rho_max, epsilon):
     return float(rho_bar + (rho_max - rho_bar) * sigma)
 
 
-# ---------- Single-run (LEARNED ONLY): rollout & collect θ ----------
-psf_learn = make_psf(LEARNED_RHO_MODE, RHO_FIXED)
-plant_single = SinglePendulum(
-    xbar=torch.tensor([np.pi, 0.0], dtype=torch.double),
-    x_init=torch.tensor([THETA0, 0.0], dtype=torch.double).view(1, -1),
-    u_init=torch.zeros(1, 1, dtype=torch.double),
-)
-
-thetas = [THETA0]
-U_prev = X_prev = None
-x_t = torch.tensor([THETA0, 0.0], dtype=torch.double).view(1, 1, -1)
-
-# --- MODIFIED: Manually init env and controller for aug_state ---
-env.state = x_t.clone().to(env.state_limit_low.device)
-env.t = 0
-aug_state_t = env._get_augmented_state().to(device)
-mad.set_ep_initial_state(initial_aug_state=aug_state_t)
+# --- MODIFIED: Moved obstacle_patch to global scope ---
+obstacle_patch = None
 # --- END MODIFIED ---
 
-mad.reset_ep_timestep()
-mad.update_dynamics_input_time_window()
-mad.w = torch.zeros(mad.num_physical_states, dtype=torch.double).to(device)
+# --- MODIFIED: Main loop for generating all GIFs ---
+theta0_grid = np.linspace(THETA0_MIN, THETA0_MAX, THETA0_N)
+print(f"Generating {THETA0_N} GIFs for theta0 in [{THETA0_MIN:.2f}, {THETA0_MAX:.2f}]...")
 
-for k in range(sim_horizon):
-    x_np = x_t.view(-1).cpu().numpy()
+for i, th0 in enumerate(theta0_grid):
+    print(f"--- Simulation {i + 1}/{THETA0_N} (theta_0 = {th0:.3f}) ---")
 
-    # --- MODIFIED: Get aug_state and call policy ---
-    aug_state_t = env._get_augmented_state().to(device)
-    uL_tensor = mad.learned_policy(
-        aug_state_t,
-        mad.dynamics_input_time_window,
-        mad.dynamics_disturbance_time_window
+    # ---------- (Re)initialize simulation ---
+    psf_learn = make_psf(LEARNED_RHO_MODE, RHO_FIXED)
+    plant_single = SinglePendulum(
+        xbar=torch.tensor([np.pi, 0.0], dtype=torch.double),
+        x_init=torch.tensor([th0, 0.0], dtype=torch.double).view(1, -1),  # Use th0
+        u_init=torch.zeros(1, 1, dtype=torch.double),
     )
-    # --- END MODIFIED ---
 
-    uL = np.asarray(uL_tensor, dtype=float).reshape(-1)
+    thetas = [th0]
+    U_prev = X_prev = None
+    x_t = torch.tensor([th0, 0.0], dtype=torch.double).view(1, 1, -1)  # Use th0
 
-    try:
-        if k == 0:
-            U_sol, X_sol, _ = psf_learn.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL)
-        else:
-            U_sol, X_sol, _ = psf_learn.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL, U_prev, X_prev)
-    except Exception:
-        U_sol = X_sol = None
-
-    if U_sol is None:
-        u_cmd = uL.reshape(1, 1, 1);
-        U_prev = X_prev = None
-    else:
-        u_cmd = U_sol[:, 0:1].reshape(1, 1, 1);
-        U_prev, X_prev = U_sol, X_sol
-
-    # integrate
-    x_t = plant_single.rk4_integration(x_t, torch.tensor(u_cmd, dtype=torch.double))
-
-    # --- MODIFIED: Update env state/time for next loop iter ---
+    # (Re)init env and controller
     env.state = x_t.clone().to(env.state_limit_low.device)
-    env.t += 1
+    env.t = 0
+    aug_state_t = env._get_augmented_state().to(device)
+    mad.set_ep_initial_state(initial_aug_state=aug_state_t)
+    mad.reset_ep_timestep()
+    mad.update_dynamics_input_time_window()
+    mad.w = torch.zeros(mad.num_physical_states, dtype=torch.double).to(device)
+
+    # --- Simulation loop (uses plot_horizon) ---
+    for k in range(plot_horizon):  # <-- Use plot_horizon
+        x_np = x_t.view(-1).cpu().numpy()
+
+        # Get aug_state and call policy
+        aug_state_t = env._get_augmented_state().to(device)
+        uL_tensor = mad.learned_policy(
+            aug_state_t,
+            mad.dynamics_input_time_window,
+            mad.dynamics_disturbance_time_window
+        )
+
+        uL = np.asarray(uL_tensor, dtype=float).reshape(-1)
+
+        try:
+            if k == 0:
+                U_sol, X_sol, _ = psf_learn.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL)
+            else:
+                U_sol, X_sol, _ = psf_learn.solve_mpc(x_np, np.array([np.pi, 0.0], dtype=float), uL, U_prev, X_prev)
+        except Exception:
+            U_sol = X_sol = None
+
+        if U_sol is None:
+            u_cmd = uL.reshape(1, 1, 1);
+            U_prev = X_prev = None
+        else:
+            u_cmd = U_sol[:, 0:1].reshape(1, 1, 1);
+            U_prev, X_prev = U_sol, X_sol
+
+        # integrate
+        x_t = plant_single.rk4_integration(x_t, torch.tensor(u_cmd, dtype=torch.double))
+
+        # Update env state/time for next loop iter
+        env.state = x_t.clone().to(env.state_limit_low.device)
+        env.t += 1
+
+        thetas.append(float(x_t.view(-1)[0]))
+
+        # advance SSM windows
+        mad.update_ep_timestep()
+        mad.update_dynamics_input_time_window()
+
+    # --- (Re)Build the GIF (inside loop) ---
+    fig, ax = plt.subplots(figsize=(5.2, 5.2))
+    R_draw = 1.05 * L_link
+    ax.set_xlim([-R_draw, R_draw]);
+    ax.set_ylim([-R_draw, R_draw])
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(rf"Pendulum + PSF ($\theta_0$ = {th0:.3f})")  # <-- Dynamic title
+    ax.set_xlabel("x");
+    ax.set_ylabel("y")
+    ax.grid(True, alpha=0.3)
+
+    rod_line, = ax.plot([], [], lw=2.5, solid_capstyle='round')
+    tip_trace, = ax.plot([], [], lw=1.0, ls='--', alpha=0.6)
+    tip_dot, = ax.plot([], [], 'o', ms=5)
+    ax.plot([0.0], [0.0], 'ko', ms=4)  # pivot
+
+    # --- MODIFIED: Reset hist per-GIF ---
+    tip_x_hist, tip_y_hist = [], []
+
+
     # --- END MODIFIED ---
 
-    thetas.append(float(x_t.view(-1)[0]))
-
-    # advance SSM windows
-    mad.update_ep_timestep()
-    mad.update_dynamics_input_time_window()
-
-# ---------- Build the GIF (2D pendulum + 95% obstacle disk) ----------
-fig, ax = plt.subplots(figsize=(5.2, 5.2))
-R_draw = 1.05 * L_link
-ax.set_xlim([-R_draw, R_draw]);
-ax.set_ylim([-R_draw, R_draw])
-ax.set_aspect("equal", adjustable="box")
-ax.set_title("Pendulum + PSF + Trained Policy")
-ax.set_xlabel("x");
-ax.set_ylabel("y")
-ax.grid(True, alpha=0.3)
-
-rod_line, = ax.plot([], [], lw=2.5, solid_capstyle='round')
-tip_trace, = ax.plot([], [], lw=1.0, ls='--', alpha=0.6)
-tip_dot, = ax.plot([], [], 'o', ms=5)
-ax.plot([0.0], [0.0], 'ko', ms=4)  # pivot
-
-obstacle_patch = None
-tip_x_hist, tip_y_hist = [], []
-
-# BEFORE the functions
-obstacle_patch = None
-tip_x_hist, tip_y_hist = [], []
+    # Define anim functions inside the loop to capture 'thetas' and 'tip_x_hist'
+    def init_anim():
+        rod_line.set_data([], [])
+        tip_trace.set_data([], [])
+        tip_dot.set_data([], [])
+        return rod_line, tip_trace, tip_dot
 
 
-def init():
-    rod_line.set_data([], [])
-    tip_trace.set_data([], [])
-    tip_dot.set_data([], [])
-    return rod_line, tip_trace, tip_dot
+    def frame_anim(i):
+        # --- MODIFIED: Use global ---
+        global obstacle_patch
+        # --- END MODIFIED ---
+        theta = thetas[i]
+        x_tip = L_link * np.sin(theta)
+        y_tip = -L_link * np.cos(theta)
+        tip_x_hist.append(x_tip);
+        tip_y_hist.append(y_tip)
+
+        rod_line.set_data([0.0, x_tip], [0.0, y_tip])
+        tip_trace.set_data(tip_x_hist, tip_y_hist)
+        tip_dot.set_data([x_tip], [y_tip])
+
+        # obstacle @ 95% PDF disk
+        if obstacle_patch is not None:
+            obstacle_patch.remove()
+            obstacle_patch = None
+
+        # Clamp obstacle time index
+        safe_i = min(i, T_total - 1)
+        pos_t, covs_t = moving_obs.get_obstacles(safe_i)
+        cx, cy = float(pos_t[0, 0]), float(pos_t[0, 1])
+        cov = float(covs_t[0].item() if hasattr(covs_t[0], 'item') else covs_t[0])
+        r95 = np.sqrt(CHI2_2_93 * cov)
+
+        obstacle_patch = Circle((cx, cy), r95,
+                                facecolor=(0.8, 0.2, 0.2, 0.25),
+                                edgecolor=(0.6, 0.0, 0.0, 0.8),
+                                lw=1.0, zorder=0)
+        ax.add_patch(obstacle_patch)
+        return rod_line, tip_trace, tip_dot, obstacle_patch
 
 
-def frame(i):
-    global obstacle_patch  # <-- change from 'nonlocal' to 'global'
-    theta = thetas[i]
-    x_tip = L_link * np.sin(theta)
-    y_tip = -L_link * np.cos(theta)
-    tip_x_hist.append(x_tip);
-    tip_y_hist.append(y_tip)
+    # --- Animate and Save ---
+    ani = FuncAnimation(fig, frame_anim, frames=(plot_horizon + 1),  # <-- Use plot_horizon
+                        init_func=init_anim, interval=DT * 1000, blit=True, repeat=False)
 
-    rod_line.set_data([0.0, x_tip], [0.0, y_tip])
-    tip_trace.set_data(tip_x_hist, tip_y_hist)
-    tip_dot.set_data([x_tip], [y_tip])
+    # --- THIS IS THE FIX ---
+    gif_filename = f"pendulum_th0_{th0:.3f}".replace(".", "_") + ".gif"  # Make filename safe
+    # --- END FIX ---
+    gif_path_current = os.path.join(GIF_DIR_RUN, gif_filename)
 
-    # obstacle @ 95% PDF disk
-    if obstacle_patch is not None:
-        obstacle_patch.remove()
-        obstacle_patch = None
+    ani.save(gif_path_current, writer=PillowWriter(fps=FPS))
+    plt.close(fig)
+    print(f"[Saved GIF] {gif_path_current}")
 
-    pos_t, covs_t = moving_obs.get_obstacles(i)
-    cx, cy = float(pos_t[0, 0]), float(pos_t[0, 1])
-    cov = float(covs_t[0].item() if hasattr(covs_t[0], 'item') else covs_t[0])
-    r95 = np.sqrt(CHI2_2_95 * cov)
-
-    obstacle_patch = Circle((cx, cy), r95,
-                            facecolor=(0.8, 0.2, 0.2, 0.25),
-                            edgecolor=(0.6, 0.0, 0.0, 0.8),
-                            lw=1.0, zorder=0)
-    ax.add_patch(obstacle_patch)
-    return rod_line, tip_trace, tip_dot, obstacle_patch
-
-
-ani = FuncAnimation(fig, frame, frames=(sim_horizon + 1),
-                    init_func=init, interval=DT * 1000, blit=True, repeat=False)
-ani.save(GIF_PATH, writer=PillowWriter(fps=FPS))
-plt.close(fig)
-print(f"[Saved GIF] {GIF_PATH}")
+# --- END Main loop ---
