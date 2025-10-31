@@ -14,12 +14,10 @@ from mad_controller import MADController
 from pendulum_env import PendulumEnv
 from obstacles import MovingObstacle
 from plot_functions import plot_results
-from single_pendulum_sys import SinglePendulum, SinglePendulumCasadi
-from PSF import MPCPredictSafetyFilter
 
 # ----------------------------- 0) MODE & PATHS -----------------------------
-START_MODE = "scratch"   # "scratch" or "resume"
-RESUME_RUN_FOLDER = "PSF_SSM_NS_10_29_12_30_09"
+START_MODE = "scratch"   # "scratch" or "resume" - MUST BE SCRATCH
+RESUME_RUN_FOLDER = "PSF_SSM_NS_10_30_18_58_12" # Ignored if scratch
 
 # ---------------- 0bis) Hyperparameters & Reproducibility ------------------
 torch.set_default_dtype(torch.double)
@@ -31,7 +29,7 @@ mpl.rcParams['text.usetex'] = False
 sim_horizon       = 250
 sampled_noise_    = 0.1
 
-loss_x_multiplier       = 0.15
+loss_x_multiplier       = 0.2
 loss_u_match_multiplier = 0.01
 loss_u_abs_multiplier   = 0.01
 loss_obs_multiplier     = 5.0
@@ -39,7 +37,7 @@ alpha_cer               = 0.2
 
 epsilon           = 0.05
 dim_internal      = 10
-num_epochs        = 350
+num_epochs        = 875
 
 obs_centers       = torch.tensor([[1.0, 0.5]])
 obs_covs          = torch.tensor([0.005])            # isotropic variance σ²
@@ -56,6 +54,7 @@ start_position    = np.pi / 2
 noise_std         = 0.8
 theta0_low, theta0_high = 3.14 - 2.3, 3.14 - 1
 theta0_low, theta0_high = 3.14 - 2.3, 3.14 +2.3
+#theta0_low, theta0_high = 3.14 - 2.3, 3.14 -0.5
 decayExpNoise     = 0.95
 PSFhorizon        = 20
 
@@ -236,7 +235,7 @@ env = PendulumEnv(
     Qlyapunov=Qlyapunov,
     Rlyapunov=Rlyapunov,
     horizon = PSFhorizon,
-    final_convergence_window=(sim_horizon-50, sim_horizon),
+    final_convergence_window=(sim_horizon-60, sim_horizon),
     convergence_theta_tol=0.05,
     convergence_omega_tol=0.1,
     convergence_hold_steps=20,
@@ -293,7 +292,9 @@ def deterministic_actor(controller: MADController):
         controller.actor_model.train(was_training); torch.set_grad_enabled(True)
 
 def evaluate_policy(controller: MADController, n_inits: int = 5, timesteps: int = None) -> float:
-    if timesteps is None: timesteps = sim_horizon
+    # --- MODIFIED: Use sim_horizon + 2 ---
+    if timesteps is None: timesteps = sim_horizon + 2
+    # --- END MODIFIED ---
     scores = []
     with deterministic_actor(controller):
         for _ in range(n_inits):
@@ -309,7 +310,9 @@ before_prefix = os.path.join(save_folder, 'before_training')
 with deterministic_actor(mad_controller):
     rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
         torch.tensor([[start_position, 0.0]], dtype=torch.double),
-        timesteps=sim_horizon
+        # --- MODIFIED: Use sim_horizon + 2 ---
+        timesteps=sim_horizon + 2
+        # --- END MODIFIED ---
     )
 
 # Time-series figure with overlay ON
@@ -333,18 +336,20 @@ plot_results(
 best_score = -float("inf")
 best_path  = os.path.join(save_folder, "model_best.pth")
 
-initial_eval = evaluate_policy(mad_controller, n_inits=5, timesteps=sim_horizon)
+initial_eval = evaluate_policy(mad_controller, n_inits=5, timesteps=sim_horizon + 2)
 logger.info(f"[Eval] Before training: mean return over 5 inits = {initial_eval:.2f}")
 best_score = initial_eval
 mad_controller.save_model_weights(best_path)
 logger.info(f"✓ Saved initial 'best' checkpoint → {best_path}")
 
 for epoch in range(num_epochs):
-    mad_controller.train(total_episodes=1, episode_length=sim_horizon, logger=logger)
+    # --- use sim_horizon2 to show to REN what happens after sim_horizon ---
+    mad_controller.train(total_episodes=1, episode_length=sim_horizon + 2, logger=logger)
+    # --- END FIX ---
     if hasattr(mad_controller, "ou_noise") and hasattr(mad_controller.ou_noise, "std_dev"):
         mad_controller.ou_noise.std_dev = max(0.1, mad_controller.ou_noise.std_dev * decayExpNoise)
 
-    eval_return = evaluate_policy(mad_controller, n_inits=5, timesteps=sim_horizon)
+    eval_return = evaluate_policy(mad_controller, n_inits=5, timesteps=sim_horizon + 2)
     logger.info(f"[Eval] Epoch {epoch:03d}: mean return (5 inits) = {eval_return:.2f}")
 
     if eval_return > best_score:
@@ -359,7 +364,9 @@ for epoch in range(num_epochs):
         with deterministic_actor(mad_controller):
             rewards_list, obs_log, u_L_log, w_list, u_log = mad_controller.get_trajectory(
                 ic.view(1, -1),  # [[theta0, omega0]]
-                timesteps=sim_horizon
+                # --- MODIFIED: Use sim_horizon + 2 ---
+                timesteps=sim_horizon + 2
+                # --- END MODIFIED ---
             )
         plot_results(
             obs_log[:,:sim_horizon+1,:],
