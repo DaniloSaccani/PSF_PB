@@ -25,7 +25,7 @@ This repository reproduces:
   <img src="figures/figure1_theta_error_overlay.png" width="320"/>
 </p>
 <p align="center">
-  <img src="figures/figure3_jstar.png" width="320"/>
+  <img src="figures/figure3_jstar_overlay.png" width="320"/>
 </p>
 
 - an animation of the pendulum avoiding the obstacle.
