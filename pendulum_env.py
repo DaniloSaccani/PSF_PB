@@ -51,18 +51,17 @@ class PendulumEnv:
                  # --- OPTIONAL: de-emphasize early tracking ---
                  use_ramped_state_weight=False,
                  state_weight_warmup=0.20,
-                 # --- MODIFIED: Added for augmented state ---
+                 # -- Added for augmented state ---
                  sim_horizon=250,
                  obs_vel=None
                  ):
         self.n = 2  # physical state dim
         self.m = 1  # control dim
 
-        # --- MODIFIED: Context dims (REMOVED phi_t) ---
+        # --- Context dims  ---
         # context = [obs_pos_x, obs_pos_y, obs_vel_x, obs_vel_y]
         self.context_n = 2 + 2
         self.aug_n = self.n + self.context_n  # augmented state dim (now 6)
-        # --- END MODIFIED ---
 
         self.sim_horizon = float(sim_horizon)  # Still used for convergence bonus logic
         if obs_vel is None:
@@ -160,9 +159,8 @@ class PendulumEnv:
         self.control_limit_high = control_limit_high.reshape(-1)
 
         # Minimal gym-ish spaces
-        # --- MODIFIED: Observation space is the AUGMENTED state ---
+        # --- Observation space is the AUGMENTED state ---
         self.observation_space = SimpleNamespace(shape=(self.aug_n,))
-        # --- END MODIFIED ---
         self.action_space = SimpleNamespace(shape=(self.m,))
 
         # init
@@ -209,12 +207,18 @@ class PendulumEnv:
         # 1. Physical state (size 2)
         physical_state = self.state.squeeze(0).squeeze(0).to(default_device)
 
-        # 2. Context: phi_t (REMOVED)
 
-        # 3. Context: obs_pos_t (size 2)
-        # Clamp time index for obstacle lookup
+        # 2. Context: obs_pos_t (size 2)
+        # Clamp the time index to the *training horizon* (self.sim_horizon)
+        # This ensures that for all t > sim_horizon, the agent sees the
+        # *last* obstacle position it was trained on, preventing OOD inputs.
+        max_train_index = int(self.sim_horizon)
+        safe_t_index = min(self.t, max_train_index)
+
+        # Also ensure we don't index past the pre-calculated array
         max_obs_index = self.obstacle.positions.size(1) - 1
-        safe_t_index = min(self.t, max_obs_index)
+        safe_t_index = min(safe_t_index, max_obs_index)
+
         obs_pos_t, _ = self.obstacle.get_obstacles(safe_t_index)
 
         obs_pos_flat = obs_pos_t.reshape(-1).to(torch.double).to(default_device)
@@ -222,17 +226,14 @@ class PendulumEnv:
         # 4. Context: obs_vel (size 2)
         obs_vel_flat = self.obs_vel.reshape(-1).to(torch.double).to(default_device)
 
-        # --- MODIFIED: torch.cat call (REMOVED phi_t) ---
         aug_state = torch.cat([
             physical_state,
             obs_pos_flat,
             obs_vel_flat
         ])
-        # --- END MODIFIED ---
 
         return aug_state.squeeze()  # Return shape (aug_n,)
 
-    # --- END MODIFIED ---
 
     def reset(self):
         # Reset PHYSICAL state
@@ -247,9 +248,8 @@ class PendulumEnv:
         self.converged_counter = 0
         self.step_reward_convergence = torch.tensor(0.0, dtype=torch.double)
 
-        # --- MODIFIED: Return AUGMENTED state ---
+        # --- Return AUGMENTED state ---
         return self._get_augmented_state()
-        # --- END MODIFIED ---
 
     def step(self, action, U_prev=None, X_prev=None):
         # PSF expects numpy 1D
@@ -279,7 +279,7 @@ class PendulumEnv:
         # losses (match dtypes/devices)
         loss_states = lf.loss_state_tracking(self.state.squeeze(0).squeeze(0), self.target_positions, self.Q)
         # T_switch = 2/0.05
-        # # --- MODIFIED: Time-varying target for learner ---
+        # # --- MODIFIED temp: Time-varying target for learner ---
         # current_physical_state = self.state.squeeze(0).squeeze(0)  # Get physical state [theta, omega]
         #
         # if self.t < T_switch:
@@ -328,8 +328,14 @@ class PendulumEnv:
             x_tip = self.sys.l * torch.sin(theta)
             y_tip = -self.sys.l * torch.cos(theta)
             pos = torch.stack([x_tip, y_tip])
+
+            # --- MODIFIED: Use safe_t_index for loss calculation ---
+            max_obs_index = self.obstacle.positions.size(1) - 1
+            safe_t_index = min(self.t, max_obs_index)
             loss_obst, min_dis = self.obstacle.get_obstacle_avoidance_loss(pos, self.obstacle_avoidance_loss_function,
-                                                                           self.t)
+                                                                           safe_t_index)
+            # --- END MODIFIED ---
+
             self.step_reward_obstacle_avoidance = - self.alpha_obst * loss_obst
             min_dis = torch.as_tensor(min_dis, dtype=self.state.dtype, device=self.state.device)
             self.min_dis = torch.minimum(self.min_dis, min_dis)

@@ -154,7 +154,7 @@ class ReplayBuffer:
             (self.buffer_capacity, 1 * self.num_dynamics_states)
         )
 
-        # --- MODIFIED: Buffers for SSM *input* (physical dim) ---
+        # --- Buffers for SSM *input* (physical dim) ---
         self.initial_state_buffer = np.zeros(
             (self.buffer_capacity, self.dynamics_input_time_window, self.num_physical_states)
         )
@@ -167,7 +167,6 @@ class ReplayBuffer:
         self.next_disturbance_buffer = np.zeros(
             (self.buffer_capacity, self.dynamics_input_time_window, self.num_physical_states)
         )
-        # --- END MODIFIED ---
 
     def record(self, obs_tuple):
         """
@@ -308,7 +307,6 @@ class Actor(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, num_actions, bias=False),
         )
-        # --- END MODIFIED ---
 
         # LSTM for sequential processing of state
         if nn_type == 'lstm':
@@ -331,7 +329,6 @@ class Actor(nn.Module):
             state_features=num_dynamics_states,
             scan=True,
         )
-        # --- END MODIFIED ---
 
         self.num_states = num_states
         self.m_term = None
@@ -367,12 +364,6 @@ class Actor(nn.Module):
     ):
         """
         Forward pass to compute the action based on the state and dynamics input.
-
-        --- MODIFIED ---
-        - `state` is the *augmented* state \tilde{x}_t.
-        - The SSM (`m_dynamics`) is fed `dynamics_input_time_window` (the x0 sequence)
-          instead of `dynamics_disturbance_time_window`.
-        --- END MODIFIED ---
 
         Args:
             state (torch.Tensor): The current *augmented* state.
@@ -548,17 +539,14 @@ class MADController:
         else:
             self.target_state = target_state.to(device)  # Target is physical
 
-        # --- THIS IS THE FIX for your traceback ---
         # State error is physical, computed from slicing the augmented state
         self.state_error = self.state[:self.num_physical_states] - self.target_state
         self.w = torch.zeros(self.num_physical_states).to(device)  # Disturbance is physical
-        # --- END MODIFIED ---
 
         self.num_dynamics_states = num_dynamics_states
         self.dynamics_states_real = torch.zeros(1 * self.num_dynamics_states).to(device)
         self.dynamics_input_time_window_length = dynamics_input_time_window_length
 
-        # --- MODIFIED: SSM inputs are physical dim ---
         self.dynamics_input_time_window = torch.zeros(
             (self.dynamics_input_time_window_length, self.num_physical_states)
         ).to(device)
@@ -567,10 +555,8 @@ class MADController:
         ).to(device)
         self.ep_initial_aug_state = torch.zeros(self.num_states).to(device)
         self.ep_initial_state_error = torch.zeros(self.num_physical_states).to(device)  # Physical
-        # --- END MODIFIED ---
         self.ep_timestep = torch.ones(1).to(device)
 
-        # --- MODIFIED: Pass correct dims to Actor ---
         self.actor_model = Actor(
             num_states=self.num_states,
             num_physical_states=self.num_physical_states,
@@ -587,16 +573,13 @@ class MADController:
             num_dynamics_states=self.num_dynamics_states,
             nn_type=nn_type
         ).to(device)
-        # --- END MODIFIED ---
 
-        # --- MODIFIED: Pass correct dims to Critic ---
         self.critic_model = Critic(
             self.num_states, self.num_dynamics_states, self.num_actions
         ).to(device)
         self.target_critic = Critic(
             self.num_states, self.num_dynamics_states, self.num_actions
         ).to(device)
-        # --- END MODIFIED ---
 
         self.target_actor.load_state_dict(self.actor_model.state_dict())
         self.target_critic.load_state_dict(self.critic_model.state_dict())
@@ -611,7 +594,6 @@ class MADController:
             std_deviation=float(std_dev) * np.ones(self.num_actions),
         )
 
-        # --- MODIFIED: Pass correct dims to ReplayBuffer ---
         self.buffer = ReplayBuffer(
             buffer_capacity=buffer_capacity,
             batch_size=batch_size,
@@ -621,7 +603,6 @@ class MADController:
             num_actions=self.num_actions,
             dynamics_input_time_window=self.dynamics_input_time_window_length,
         )
-        # --- END MODIFIED ---
 
         self.gamma = gamma
         self.tau = tau
@@ -667,17 +648,23 @@ class MADController:
         Updates the dynamics input time window with the current state.
 
         --- MODIFIED ---
-        - `dynamics_input_time_window` (for x0) is populated with *physical* state error.
-        - `dynamics_disturbance_time_window` (for w) is populated with *physical* disturbance.
+        - Clamped update_index to 1 to prevent OOD all-zero input
+          (or index=0) which was not seen during training.
         --- END MODIFIED ---
         """
         self.dynamics_input_time_window *= 0.0
-        update_index = int(
-            self.dynamics_input_time_window_length - self.ep_timestep.cpu().item()
-        )
+
+        current_timestep = self.ep_timestep.cpu().item()
+        length = self.dynamics_input_time_window_length  # e.g., 251
+
+        update_index = int(length - current_timestep)  # Goes from 250 down to 1, then 0, -1, ...
+
+
+
         if update_index >= 0:
-            # x0 sequence is the initial *physical* state error
+            # This will fire for t=1..251 (indices 250..0)
             self.dynamics_input_time_window[update_index] = self.ep_initial_state_error
+        # For t > 251, update_index is < 0, and the window remains all-zeros.
 
         if self.ep_timestep == 1:
             # Disturbance sequence
@@ -714,10 +701,6 @@ class MADController:
         """
         Selects an action based on the current state and dynamics information, adding noise for exploration.
 
-        --- MODIFIED ---
-        - `state` argument is the *augmented* state.
-        --- END MODIFIED ---
-
         Args:
             state (array-like): The current *augmented* state of the agent.
             dynamics_input_time_window (array-like): The current dynamics input time window (x0).
@@ -748,9 +731,6 @@ class MADController:
         """
         Selects an action using the learned policy (actor model).
 
-        --- MODIFIED ---
-        - `state` argument is the *augmented* state.
-        --- END MODIFIED ---
 
         Args:
             state (array-like): The current *augmented* state of the agent.
@@ -789,31 +769,28 @@ class MADController:
         """
         Trains the agent over multiple episodes using the DDPG algorithm.
 
-        --- MODIFIED ---
+        --- modified ---
         - Uses `self.state` to store the augmented observation from the env.
         - Passes `self.state` to the policy.
         - Records `state` and `next_state` (augmented) in the buffer.
         - Corrected call to `set_ep_initial_state`
         - **Corrected `if` condition in `train` loop**
-        --- END MODIFIED ---
+        --- END modified ---
         """
 
         for ep in range(total_episodes):
             self.episode_count += 1
             self.ou_noise.reset()
-            # --- MODIFIED: Reset returns augmented state ---
+            # --- Reset returns augmented state ---
             self.state = self.env.reset().to(device)  # self.state now holds aug_state
             self.last_episode_ic = self.env.state.squeeze(0).squeeze(0).detach().cpu().clone()  # Store physical IC
-            # --- END MODIFIED ---
 
             self.dynamics_states_real = torch.cat(
                 [
                     self.actor_model.m_dynamics.LRUR.states_last.real.squeeze(),
                 ]
             )
-            # --- THIS IS THE FIX ---
             self.set_ep_initial_state(initial_aug_state=self.state)  # Pass aug_state
-            # --- END MODIFIED ---
             self.reset_ep_timestep()
             self.update_dynamics_input_time_window()
             episodic_reward = 0
@@ -822,14 +799,13 @@ class MADController:
             episodic_obs_reward = 0
 
             while True:
-                # --- MODIFIED: Policy takes augmented state ---
+                # --- Policy takes augmented state ---
                 action = self.policy(
                     state=self.state,
                     dynamics_input_time_window=self.dynamics_input_time_window,
                     dynamics_disturbance_time_window=self.dynamics_disturbance_time_window,
                 )
                 old_state = self.state.clone()  # old_aug_state
-                # --- END MODIFIED ---
 
                 old_dynamics_states_real = self.dynamics_states_real.clone()
                 old_dynamics_input_time_window = self.dynamics_input_time_window.clone()
@@ -837,12 +813,10 @@ class MADController:
                     self.dynamics_disturbance_time_window.clone()
                 )
 
-                # --- THIS IS THE FIX for your traceback ---
                 if self.env.t == 0:  # Check *before* step. t is 0 on first step.
                     next_state, reward, done, truncated, _, U_prev, X_prev = self.env.step(action)
                 else:
                     next_state, reward, done, truncated, _, U_prev, X_prev = self.env.step(action, U_prev, X_prev)
-                # --- END MODIFIED ---
 
                 self.state = next_state.to(device)  # self.state now holds next_aug_state
                 self.w = self.env.w  # w is physical
@@ -855,7 +829,7 @@ class MADController:
                 self.update_ep_timestep()  # Computes physical state_error
                 self.update_dynamics_input_time_window()  # Uses physical error/w
 
-                # --- MODIFIED: Record augmented states ---
+                # --- Record augmented states ---
                 obs_tuple = (
                     old_state.cpu(),
                     action,
@@ -868,7 +842,6 @@ class MADController:
                     old_dynamics_disturbance_time_window.cpu(),  # physical
                     self.dynamics_disturbance_time_window.cpu(),  # physical
                 )
-                # --- END MODIFIED ---
 
                 self.buffer.record(obs_tuple=obs_tuple)
                 episodic_reward += reward
@@ -959,13 +932,13 @@ class MADController:
         """
         Generates a trajectory by interacting with the environment from a given initial state.
 
-        --- MODIFIED ---
+        --- modified ---
         - `initial_state` is the *physical* state (size 2).
         - Manually resets env and calls `_get_augmented_state` to get the first `self.state`.
         - Passes `self.state` (augmented) to the `learned_policy`.
         - `obs_list` correctly tracks the *physical* state for plotting.
         - Corrected call to `set_ep_initial_state`
-        --- END MODIFIED ---
+        --- END modified ---
 
         Args:
             initial_state (array-like): The starting *physical* state of the trajectory (size 2).
@@ -979,7 +952,7 @@ class MADController:
                 - w_list: List of environment states (or any relevant data for the trajectory).
         """
 
-        # --- MODIFIED: Manual reset using physical state ---
+        # --- Manual reset using physical state ---
         _ = self.env.reset()  # Reset to get valid obstacle info
         # Set physical state in env
         self.env.state = initial_state.view(1, 1, -1).to(self.env.state_limit_low.device)
@@ -991,28 +964,24 @@ class MADController:
         aug_state = self.env._get_augmented_state().to(device)
         self.state = aug_state  # Set controller's state (self.state is augmented)
 
-        # --- THIS IS THE FIX ---
         self.set_ep_initial_state(initial_aug_state=self.state)  # Pass augmented state
-        # --- END MODIFIED ---
         self.reset_ep_timestep()
         self.update_dynamics_input_time_window()
 
         # obs_list tracks PHYSICAL state for plotting
         obs_list = [self.env.state.squeeze(0).squeeze(0).detach().cpu()]
-        # --- END MODIFIED ---
 
         w_list = []
         rewards_list = []
         u_L_log = []
         u_log = []
         for _ in range(timesteps):
-            # --- MODIFIED: Policy takes augmented state ---
+            # --- Policy takes augmented state ---
             action = self.learned_policy(
                 self.state,  # self.state is augmented
                 self.dynamics_input_time_window,
                 self.dynamics_disturbance_time_window,
             )
-            # --- END MODIFIED ---
 
             if self.env.t == 0:
                 obs, reward, done, truncated, info, U_prev, X_prev = self.env.step(action)
@@ -1024,7 +993,6 @@ class MADController:
 
             # --- MODIFIED: Store physical state for plotting ---
             obs_list.append(self.env.state.squeeze(0).squeeze(0).detach().cpu())
-            # --- END MODIFIED ---
 
             w_list.append(self.env.w)
             u_L_log.append(action)
@@ -1034,7 +1002,6 @@ class MADController:
 
             # --- MODIFIED: Update controller's augmented state ---
             self.state = obs.to(device)  # self.state is augmented
-            # --- END MODIFIED ---
 
             self.update_ep_timestep()
             self.update_dynamics_input_time_window()
@@ -1101,12 +1068,11 @@ class MADController:
         self.target_actor.load_state_dict(ckpt[2], strict=False)
         self.target_critic.load_state_dict(ckpt[3], strict=False)
 
-        # SSM submodules (safe either way)
+        # SSM submodules
         if len(ckpt) > 6:
             self.actor_model.m_dynamics.load_state_dict(ckpt[6], strict=False)
         if len(ckpt) > 7:
             self.target_actor.m_dynamics.load_state_dict(ckpt[7], strict=False)
-        # --- END MODIFIED ---
 
         # Optimizers: best-effort load; if it fails (old runs), re-init silently
         try:
