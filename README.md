@@ -31,7 +31,7 @@ This repository reproduces:
 - an animation of the pendulum avoiding the obstacle.
 
 <p align="center">
-  <img src="figures/pendulum_single.gif" width="320"/>
+  <img src="figures/_stitched_sweep.gif" width="320"/>
 </p>
 
 ---
