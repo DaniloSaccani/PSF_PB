@@ -1,7 +1,7 @@
 # Learning-Based Control via Predictive Safety Filters
 
 This repository contains the code used to generate the numerical example in the paper  
-**"Learning-Based Control via Predictive Safety Filters"**
+**"Safety-Aware Performance Boosting for Constrained Nonlinear Systems"**
 
 The experiment is an inverted pendulum with:
 - hard state and input constraints,
@@ -172,10 +172,10 @@ If you use this repository in academic work, please cite:
 
 ```bibtex
 @article{psf_learning_control_2025,
-  title   = {Learning-Based Control via Predictive Safety Filters},
-  author  = {Haoming Shen, Danilo Saccani, Luca Furieri, Giancarlo Ferrari-Trecate},
+  title   = {Safety-Aware Performance Boosting for Constrained Nonlinear Systems},
+  author  = {Danilo Saccani, Haoming Shen, Luca Furieri, Giancarlo Ferrari-Trecate},
   year    = {2025},
-  note    = {Preprint available at arXiv:XXXXX.XXXXX}
+  note    = {Preprint available at arXiv: - coming soon -}
 }
 ```
 
