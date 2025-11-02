@@ -58,8 +58,8 @@ ENABLE_THETA0_SWEEP = True  # set False to disable overlay computations/plots gl
 # False -> Figures 1 & 3 "sweep-only": ONLY sweep overlays (hide single-run thick lines)
 PLOT_THETA0 = False
 
-THETA0_MIN = -2.5 + 3.14  # radians conversion for 0 in pi
-THETA0_MAX =  2.4 + 3.14  # radians conversion for 0 in pi
+THETA0_MIN = -2.6 + 3.14  # radians conversion for 0 in pi
+THETA0_MAX =  2.5 + 3.14  # radians conversion for 0 in pi
 
 THETA0_N = 12  # number of θ0 samples in [min,max]
 PLOT_BASELINE_IN_SWEEP = True  # overlay PSF-only curves (baseline)
